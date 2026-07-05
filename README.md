@@ -14,13 +14,13 @@
 4. [服务端视角：vLLM V1 架构与请求生命周期](docs/04-vllm-v1-architecture.md)
 5. [工程调优地图：吞吐、延迟、显存与常见参数](docs/05-performance-tuning-map.md)
 
-### 第二阶段：深入关键模块（待补）
+### 第二阶段：深入关键模块
 
-6. Scheduler：continuous batching、prefill/decode 混排、chunked prefill
-7. Block Manager：KV block 分配、回收、共享、抢占
-8. Model Runner：一次 forward 前后到底发生了什么
-9. Attention Backend：FlashAttention、PagedAttention kernel、CUDA Graph
-10. Prefix Caching / Speculative Decoding / Quantization
+6. [Scheduler：continuous batching、prefill/decode 混排、chunked prefill](docs/06-scheduler-continuous-batching.md)
+7. [Block Manager：KV block 分配、回收、共享与抢占](docs/07-block-manager-kv-cache.md)
+8. [Model Runner：一次 forward 前后到底发生了什么](docs/08-model-runner-forward.md)
+9. [Attention Backend：FlashAttention、PagedAttention kernel 与 CUDA Graph](docs/09-attention-backend.md)
+10. [Prefix Caching、Speculative Decoding 与 Quantization](docs/10-prefix-speculative-quantization.md)
 
 ### 第三阶段：面向岗位能力（待补）
 
