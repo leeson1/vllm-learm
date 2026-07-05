@@ -22,19 +22,40 @@
 9. [Attention Backend：FlashAttention、PagedAttention kernel 与 CUDA Graph](docs/09-attention-backend.md)
 10. [Prefix Caching、Speculative Decoding 与 Quantization](docs/10-prefix-speculative-quantization.md)
 
-### 第三阶段：面向岗位能力（待补）
+### 第三阶段：面向岗位能力
 
-11. 如何读 vLLM 源码
-12. 如何压测 vLLM
-13. 如何定位 GPU/CPU/网络瓶颈
-14. vLLM vs TensorRT-LLM vs SGLang
-15. 从 C++ 游戏后端转 AI 推理：能力迁移路线
+11. [如何读 vLLM 源码：从请求生命周期切进去](docs/11-how-to-read-vllm-source.md)
+12. [如何压测 vLLM：不要只看 tokens/s](docs/12-how-to-benchmark-vllm.md)
+13. [如何定位 GPU / CPU / 网络瓶颈](docs/13-how-to-debug-bottlenecks.md)
+14. [vLLM vs TensorRT-LLM vs SGLang](docs/14-vllm-vs-tensorrt-llm-vs-sglang.md)
+15. [从 C++ 游戏后端转 AI 推理：能力迁移路线](docs/15-cpp-game-backend-to-ai-inference.md)
+
+## 下一步实践建议
+
+文章主线完成后，建议继续补实践目录：
+
+```text
+benchmarks/
+  workloads/
+  results/
+  reports/
+
+cuda-demos/
+  vector_add/
+  reduce/
+  matmul/
+  softmax/
+```
+
+也就是说，下一阶段不要继续只写文章，而要开始沉淀：压测脚本、结果数据、图表、CUDA demo 和性能分析报告。
 
 ## 主要资料来源
 
 - vLLM 官方文档：https://docs.vllm.ai/
 - vLLM GitHub：https://github.com/vllm-project/vllm
 - PagedAttention 论文：https://arxiv.org/abs/2309.06180
+- NVIDIA TensorRT-LLM：https://nvidia.github.io/TensorRT-LLM/
+- SGLang：https://docs.sglang.ai/
 
 ## 阅读建议
 
