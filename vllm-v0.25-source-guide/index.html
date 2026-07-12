@@ -1,0 +1,1652 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; style-src 'unsafe-inline' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; img-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; font-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; media-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; worker-src blob:; connect-src blob: data:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>vLLM v0.25.0 请求处理与 KV Cache 源码解析</title>
+<style>:root{color-scheme:light dark;background:light-dark(rgb(255 255 255), rgb(24 24 24))}html,body{margin:0}body{box-sizing:border-box;padding:1rem;background:inherit}iframe{display:block;width:100%;max-width:736px;height:calc(100vh - 2rem);margin:0 auto;border:0}</style>
+</head>
+<body>
+<iframe sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="vLLM v0.25.0 请求处理与 KV Cache 源码解析" srcdoc="&lt;!doctype html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;
+&lt;meta name=&quot;referrer&quot; content=&quot;no-referrer&quot;&gt;
+&lt;meta http-equiv=&quot;Content-Security-Policy&quot; content=&quot;default-src &#x27;none&#x27;; script-src &#x27;unsafe-inline&#x27; &#x27;unsafe-eval&#x27; &#x27;wasm-unsafe-eval&#x27; blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; style-src &#x27;unsafe-inline&#x27; blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; img-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; font-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; media-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; worker-src blob:; connect-src blob: data:; frame-src &#x27;none&#x27;; object-src &#x27;none&#x27;; base-uri &#x27;none&#x27;; form-action &#x27;none&#x27;&quot;&gt;
+&lt;title&gt;vLLM v0.25.0 请求处理与 KV Cache 源码解析&lt;/title&gt;
+&lt;style&gt;:root {
+  color-scheme: light dark;
+  background-color: var(--background) !important;
+
+  /* Agent-facing contract; keep in sync with SKILL.md. */
+  --background: light-dark(rgb(255 255 255), rgb(24 24 24));
+  --foreground: light-dark(rgb(26 28 31), rgb(255 255 255));
+  --card: color-mix(in oklab, var(--foreground) 5%, transparent);
+  --card-foreground: var(--foreground);
+  --popover: light-dark(rgb(255 255 255), rgb(45 45 45));
+  --popover-foreground: var(--foreground);
+  --primary: light-dark(rgb(51 156 255), rgb(131 195 255));
+  --primary-foreground: light-dark(rgb(255 255 255), rgb(13 13 13));
+  --secondary: light-dark(rgb(255 255 255 / 96%), rgb(54 54 54 / 96%));
+  --secondary-foreground: var(--foreground);
+  --muted: color-mix(in srgb, var(--foreground) 10%, transparent);
+  --muted-foreground: light-dark(
+    rgb(26 28 31 / 49.4%),
+    rgb(255 255 255 / 49.8%)
+  );
+  --accent: light-dark(rgb(229 242 255), rgb(13 39 63));
+  --accent-foreground: var(--primary);
+  --destructive: light-dark(rgb(226 85 7), rgb(255 133 73));
+  --border: light-dark(rgb(26 28 31 / 8%), rgb(255 255 255 / 8.2%));
+  --input: light-dark(
+    rgb(26 28 31 / 11.8%),
+    color-mix(in oklab, rgb(0 0 0) 10%, transparent)
+  );
+  --ring: light-dark(rgb(51 156 255), rgb(131 195 255 / 76%));
+  --font-size-base: 14px;
+  --viz-series-1: var(--primary);
+  --viz-series-2: light-dark(rgb(243 136 59), rgb(245 154 86));
+  --viz-series-3: light-dark(rgb(93 201 119), rgb(116 213 139));
+  --viz-series-4: light-dark(rgb(235 119 177), rgb(240 143 192));
+  --viz-series-5: light-dark(rgb(155 121 236), rgb(170 145 239));
+  --viz-series-6: light-dark(rgb(58 185 177), rgb(90 203 194));
+
+  /* Internal implementation variables; not part of the agent contract. */
+  --font-sans: -apple-system, system-ui, &quot;Segoe UI&quot;, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, &quot;SF Mono&quot;, Menlo, Consolas, &quot;Liberation Mono&quot;,
+    monospace;
+  --font-size-normal: max(11px, var(--font-size-base));
+  --font-size-tooltip: calc(var(--font-size-base) - 1px);
+  --font-size-small: max(11px, calc(var(--font-size-base) - 2px));
+  --font-size-h1: calc(var(--font-size-normal) * 1.7142857143);
+  --font-size-h2: calc(var(--font-size-normal) * 1.4285714286);
+  --font-size-h3: calc(var(--font-size-normal) * 1.2857142857);
+  --font-weight-normal: 430;
+  --font-weight-medium: 500;
+  --line-height-normal: calc(var(--font-size-normal) * 1.5);
+  --line-height-tooltip: calc(var(--font-size-tooltip) * 1.4285714286);
+  --line-height-small: calc(var(--font-size-small) + 4px);
+  --radius: 12.5px;
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-2xl: calc(var(--radius) * 1.6);
+  --radius-full: 9999px;
+  --shadow-sm: 0 1px 2px -1px rgb(0 0 0 / 8%);
+  --checkmark-image: url(&quot;data:image/svg+xml,%3Csvg xmlns=&#x27;http://www.w3.org/2000/svg&#x27; viewBox=&#x27;0 0 17 17&#x27;%3E%3Cpath d=&#x27;M12.8961 3.64101C13.1297 3.41418 13.4984 3.37523 13.7779 3.56581C14.0571 3.75635 14.1554 4.11331 14.0299 4.41347L13.9615 4.53847L7.71151 13.7045C7.59411 13.8767 7.4063 13.9877 7.19881 14.0072C6.99136 14.0267 6.78564 13.9533 6.63826 13.806L2.88826 10.056L2.79842 9.9457C2.6192 9.67407 2.64927 9.30496 2.88826 9.06581C3.12738 8.82669 3.49647 8.79676 3.76815 8.97597L3.8785 9.06581L7.03084 12.2182L12.8053 3.74941L12.8961 3.64101Z&#x27;/%3E%3C/svg%3E&quot;);
+
+  /* Legacy aliases; not part of the current agent contract. */
+  --viz-bg: transparent;
+  --viz-panel: var(--card);
+  --viz-border: var(--border);
+  --viz-text: var(--foreground);
+  --viz-muted: var(--muted-foreground);
+  --viz-accent: var(--primary);
+  --viz-accent-text: var(--primary-foreground);
+  --viz-accent-bg: var(--accent);
+  --viz-font-size: var(--font-size-base);
+  --viz-warning: var(--destructive);
+  --color-background-primary: var(--background);
+  --color-text-primary: var(--foreground);
+  --color-border-secondary: var(--border);
+}
+
+:root[data-theme=&quot;light&quot;] {
+  color-scheme: light;
+}
+
+:root[data-theme=&quot;dark&quot;] {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html &gt; body {
+  margin: 0;
+  padding: 5px;
+  color: var(--foreground);
+  background: transparent !important;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-normal);
+  font-weight: var(--font-weight-normal);
+  line-height: var(--line-height-normal);
+}
+
+a {
+  color: color-mix(in srgb, var(--viz-accent) 80%, var(--viz-text) 20%);
+  cursor: pointer;
+  font-weight: var(--viz-font-weight-medium);
+  text-decoration: none;
+  text-underline-offset: 2px;
+}
+
+a:is(:hover, :focus-visible) {
+  text-decoration-line: underline;
+  text-decoration-style: dashed;
+  text-decoration-thickness: 0.5px;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  margin-block: 0;
+}
+
+h1 {
+  font-size: var(--font-size-h1);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h2 {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h3,
+h4,
+h5,
+h6 {
+  font-size: var(--font-size-h3);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.3;
+}
+
+b,
+strong,
+th {
+  font-weight: var(--font-weight-medium);
+}
+
+code:not(pre code) {
+  display: inline;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  corner-shape: superellipse(1.5);
+  background: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  word-break: break-word;
+}
+
+#widget {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  padding: 0;
+  background: transparent !important;
+}
+
+.card {
+  min-width: 0;
+  padding: 12px;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  border-radius: var(--radius-2xl);
+  corner-shape: superellipse(1.5);
+  color: var(--card-foreground);
+  background: var(--card);
+}
+
+#widget &gt; :not(.card) {
+  width: 100% !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.tooltip {
+  position: fixed;
+  z-index: 50;
+  top: 0;
+  left: 0;
+  width: max-content;
+  max-width: min(
+    20rem,
+    var(--tooltip-available-width, calc(100vw - 10px)),
+    calc(100vw - 10px)
+  );
+  max-height: min(
+    var(--tooltip-available-height, calc(100vh - 10px)),
+    calc(100vh - 10px)
+  );
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--popover-foreground);
+  background: var(--popover);
+  box-shadow: none;
+  font-size: var(--font-size-tooltip);
+  line-height: var(--line-height-tooltip);
+  overflow-wrap: break-word;
+  white-space: normal;
+  pointer-events: none;
+  user-select: none;
+}
+
+.viz-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(max(180px, 24%), 1fr));
+  gap: 10px;
+}
+
+.viz-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.viz-stat-value {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+.viz-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.viz-badge {
+  padding: 3px 8px;
+  border-radius: var(--radius-full);
+  color: var(--accent-foreground);
+  background: var(--accent);
+  font-weight: var(--font-weight-medium);
+}
+
+small,
+.text-small,
+.viz-badge {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.text-muted {
+  color: var(--muted-foreground);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.viz-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.viz-controls &gt; .form-label {
+  display: grid;
+  min-width: min(100%, 260px);
+  flex: 1 1 280px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 12px;
+  margin-bottom: 0;
+}
+
+.viz-controls &gt; .form-label &gt; :is(.form-control, .form-range, .form-select) {
+  grid-column: 1 / -1;
+}
+
+.btn,
+.form-check-input,
+.form-control,
+.form-range,
+.form-select {
+  font: inherit;
+}
+
+.btn {
+  appearance: button;
+  display: inline-flex;
+  inline-size: fit-content;
+  max-inline-size: 100%;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0 8px;
+  -webkit-app-region: no-drag;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: var(--cursor-interaction, pointer);
+  text-align: center;
+  text-decoration: none;
+  white-space: nowrap;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.btn:is(.btn-block, .viz-tile) {
+  inline-size: 100%;
+}
+
+.btn.viz-tile {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+a.btn {
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.btn:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.btn-primary {
+  border-color: transparent;
+  color: var(--primary-foreground);
+  background: var(--foreground);
+  background-clip: padding-box;
+}
+
+.btn-primary .text-muted {
+  color: color-mix(in srgb, var(--primary-foreground) 50%, transparent);
+}
+
+.btn-primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 80%, transparent);
+  background-clip: padding-box;
+}
+
+.btn-ghost {
+  border-color: transparent;
+  color: var(--muted-foreground);
+  background: transparent;
+}
+
+.btn-ghost:not(:disabled):hover {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+[data-lucide] {
+  stroke-width: 1.6;
+}
+
+.form-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--foreground);
+}
+
+.form-control {
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--foreground);
+  background: var(--secondary);
+}
+
+.form-control::placeholder {
+  color: var(--muted-foreground);
+}
+
+.form-control[type=&quot;file&quot;] {
+  padding: 0;
+  overflow: hidden;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control[type=&quot;file&quot;]::file-selector-button {
+  min-height: 26px;
+  margin-right: 8px;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid var(--input);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: inherit;
+  font: inherit;
+}
+
+.form-control[type=&quot;file&quot;]:not(:disabled):hover::file-selector-button {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-control-color[type=&quot;color&quot;] {
+  width: 40px;
+  height: 28px;
+  padding: 3px;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control-color[type=&quot;color&quot;]::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.form-control-color[type=&quot;color&quot;]::-webkit-color-swatch {
+  border: 0;
+  border-radius: calc(var(--radius-lg) - 4px);
+  corner-shape: superellipse(1.5);
+}
+
+textarea.form-control {
+  height: auto;
+  min-height: 72px;
+  padding: 8px 10px;
+  resize: vertical;
+}
+
+.form-control:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-control:disabled,
+.form-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.form-select {
+  appearance: none;
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 32px 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--foreground);
+  background-color: var(--secondary);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted-foreground) 50%),
+    linear-gradient(135deg, var(--muted-foreground) 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 50%,
+    calc(100% - 10px) 50%;
+  background-repeat: no-repeat;
+  background-size: 4px 4px;
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-select:not(:disabled):hover {
+  background-color: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-select:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-check {
+  display: flex;
+  min-height: 20px;
+  align-items: center;
+  gap: 6px;
+}
+
+.form-check-input {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  border: 1px solid var(--input);
+  color: var(--primary-foreground);
+  background-color: transparent;
+  cursor: var(--cursor-interaction, default);
+  transition:
+    background-color 150ms,
+    border-color 150ms,
+    box-shadow 150ms;
+}
+
+.form-check:not(.form-switch) .form-check-input[type=&quot;checkbox&quot;] {
+  border-color: var(--input);
+  border-radius: var(--radius-sm);
+  corner-shape: superellipse(1.5);
+  background-color: var(--secondary);
+  box-shadow: var(--shadow-sm);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input:not(:disabled):not(:checked):hover {
+  background-color: var(--card);
+}
+
+.form-check:not(.form-switch) .form-check-input[type=&quot;checkbox&quot;]:checked {
+  border-color: var(--primary);
+  background-color: var(--primary);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input[type=&quot;checkbox&quot;]:checked::before {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--primary-foreground);
+  content: &quot;&quot;;
+  mask: var(--checkmark-image) center / 12px 12px no-repeat;
+}
+
+.form-check-input[type=&quot;radio&quot;] {
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-full);
+}
+
+.form-check-input[type=&quot;radio&quot;]:checked {
+  border: 2px solid var(--primary);
+  background:
+    radial-gradient(circle, var(--primary-foreground) 0 2.5px, transparent 3px),
+    var(--primary);
+}
+
+.form-check:not(.form-switch) .form-check-input:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+}
+
+.form-switch .form-check-input:disabled,
+.form-switch .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.form-check-label {
+  color: var(--foreground);
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-switch .form-check-input {
+  position: relative;
+  width: 32px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--muted);
+  box-shadow: none;
+  transition: background-color 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input::before {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 16px;
+  height: 16px;
+  box-sizing: border-box;
+  border: 1px solid light-dark(var(--primary-foreground), var(--foreground));
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+  box-shadow: var(--shadow-sm);
+  content: &quot;&quot;;
+  transform: translate(2px, -50%);
+  transition: transform 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input:checked {
+  background: var(--primary);
+}
+
+.form-switch .form-check-input:checked::before {
+  transform: translate(14px, -50%);
+}
+
+.form-switch .form-check-input:focus-visible {
+  box-shadow: 0 0 0 2px var(--ring);
+}
+
+.form-range {
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 28px;
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  outline: none;
+  border: 0;
+  accent-color: var(--primary);
+  background: linear-gradient(
+      color-mix(in srgb, var(--foreground) 7%, transparent),
+      color-mix(in srgb, var(--foreground) 7%, transparent)
+    )
+    center / 100% 2px no-repeat;
+}
+
+.form-range::-webkit-slider-runnable-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-webkit-slider-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range::-moz-range-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-moz-range-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.btn:not(.btn-primary, .viz-tile):is(
+    [aria-pressed=&quot;true&quot;],
+    [aria-selected=&quot;true&quot;],
+    .is-selected
+  ) {
+  border-color: var(--primary);
+  color: var(--primary-foreground);
+  background: var(--primary);
+}
+
+.btn.viz-tile:is([aria-pressed=&quot;true&quot;], [aria-selected=&quot;true&quot;], .is-selected) {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+#widget &gt; svg {
+  width: 100%;
+}
+
+.text-warning,
+.text-destructive {
+  color: var(--destructive);
+}
+
+html&gt;body{padding:0}&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;div id=&quot;vllm-source-atlas&quot;&gt;
+  &lt;style&gt;
+    #vllm-source-atlas {
+      --atlas-gap: 1rem;
+      color: var(--foreground);
+      display: grid;
+      gap: 2rem;
+      padding: 0.25rem 0 3rem;
+    }
+    #vllm-source-atlas * { box-sizing: border-box; }
+    #vllm-source-atlas a { color: var(--foreground); }
+    #vllm-source-atlas code { overflow-wrap: anywhere; }
+    #vllm-source-atlas .scope-note code,
+    #vllm-source-atlas .formula code { white-space: normal; }
+    #vllm-source-atlas .hero { display: grid; gap: 1rem; }
+    #vllm-source-atlas .eyebrow {
+      color: var(--muted-foreground);
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      align-items: center;
+    }
+    #vllm-source-atlas .hero h1 { margin: 0; max-width: 18ch; }
+    #vllm-source-atlas .lede { max-width: 68ch; margin: 0; color: var(--muted-foreground); }
+    #vllm-source-atlas .quick-nav { display: flex; gap: .35rem; flex-wrap: wrap; }
+    #vllm-source-atlas .section { display: grid; gap: 1rem; scroll-margin-top: 1rem; }
+    #vllm-source-atlas .section-head { display: grid; gap: .35rem; }
+    #vllm-source-atlas .section-head h2,
+    #vllm-source-atlas .section-head p { margin: 0; }
+    #vllm-source-atlas .section-head p { color: var(--muted-foreground); max-width: 72ch; }
+    #vllm-source-atlas .takeaways { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    #vllm-source-atlas .takeaway { display: grid; gap: .45rem; }
+    #vllm-source-atlas .takeaway .n { color: var(--muted-foreground); }
+    #vllm-source-atlas .takeaway p { margin: 0; }
+    #vllm-source-atlas .architecture {
+      display: grid;
+      grid-template-columns: 1.15fr auto 1fr auto 1.15fr;
+      gap: .55rem;
+      align-items: stretch;
+    }
+    #vllm-source-atlas .arch-node {
+      min-height: 9rem;
+      padding: .9rem;
+      display: grid;
+      align-content: start;
+      gap: .55rem;
+      background: color-mix(in srgb, var(--viz-series-1) 9%, transparent);
+    }
+    #vllm-source-atlas .arch-node.engine { background: color-mix(in srgb, var(--viz-series-2) 10%, transparent); }
+    #vllm-source-atlas .arch-node.worker { background: color-mix(in srgb, var(--viz-series-3) 10%, transparent); }
+    #vllm-source-atlas .arch-node h3,
+    #vllm-source-atlas .arch-node p { margin: 0; }
+    #vllm-source-atlas .arch-node p { color: var(--muted-foreground); }
+    #vllm-source-atlas .arch-node code { width: fit-content; }
+    #vllm-source-atlas .arch-arrow {
+      align-self: center;
+      display: grid;
+      justify-items: center;
+      gap: .25rem;
+      color: var(--muted-foreground);
+    }
+    #vllm-source-atlas .arch-arrow strong { color: var(--foreground); }
+    #vllm-source-atlas .return-line {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: .55rem;
+      align-items: center;
+      color: var(--muted-foreground);
+    }
+    #vllm-source-atlas .return-line .line { height: 1px; background: var(--border); }
+    #vllm-source-atlas .scope-note { margin: 0; color: var(--muted-foreground); }
+    #vllm-source-atlas .flow-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(17rem, .8fr);
+      gap: 1rem;
+      align-items: start;
+    }
+    #vllm-source-atlas .flow-list { display: grid; gap: .45rem; min-width: 0; }
+    #vllm-source-atlas .flow-step {
+      display: grid;
+      grid-template-columns: 2rem 1fr auto;
+      gap: .65rem;
+      align-items: center;
+      width: 100%;
+      text-align: left;
+    }
+    #vllm-source-atlas .flow-step .step-no { color: var(--muted-foreground); }
+    #vllm-source-atlas .flow-step .step-copy { display: grid; gap: .1rem; }
+    #vllm-source-atlas .flow-step .step-copy small { color: var(--muted-foreground); }
+    #vllm-source-atlas .flow-step &gt; code {
+      max-width: 9.5rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #vllm-source-atlas .flow-step[aria-pressed=&quot;true&quot;] .step-no { color: var(--primary-foreground); }
+    #vllm-source-atlas .flow-detail { display: grid; gap: .8rem; position: sticky; top: 1rem; min-width: 0; }
+    #vllm-source-atlas .flow-detail h3,
+    #vllm-source-atlas .flow-detail p { margin: 0; }
+    #vllm-source-atlas .detail-meta { display: grid; gap: .45rem; }
+    #vllm-source-atlas .detail-row {
+      display: grid;
+      grid-template-columns: 4.5rem 1fr;
+      gap: .6rem;
+      align-items: start;
+    }
+    #vllm-source-atlas .detail-row &gt; span:first-child { color: var(--muted-foreground); }
+    #vllm-source-atlas .detail-row code,
+    #vllm-source-atlas .detail-row a,
+    #vllm-source-atlas .flow-detail p { overflow-wrap: anywhere; min-width: 0; }
+    #vllm-source-atlas .loop {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: .55rem;
+      align-items: stretch;
+    }
+    #vllm-source-atlas .loop-cell {
+      display: grid;
+      gap: .4rem;
+      align-content: start;
+      padding: .8rem;
+      background: color-mix(in srgb, var(--muted) 58%, transparent);
+    }
+    #vllm-source-atlas .loop-cell.active { background: color-mix(in srgb, var(--viz-series-2) 11%, transparent); }
+    #vllm-source-atlas .loop-cell h3,
+    #vllm-source-atlas .loop-cell p { margin: 0; }
+    #vllm-source-atlas .loop-cell p { color: var(--muted-foreground); }
+    #vllm-source-atlas .loop-caption { margin: 0; color: var(--muted-foreground); }
+    #vllm-source-atlas .kv-why { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    #vllm-source-atlas .kv-why article { display: grid; gap: .5rem; }
+    #vllm-source-atlas .kv-why h3,
+    #vllm-source-atlas .kv-why p { margin: 0; }
+    #vllm-source-atlas .kv-why p { color: var(--muted-foreground); }
+    #vllm-source-atlas .mini-sequence {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: .5rem;
+      align-items: center;
+    }
+    #vllm-source-atlas .mini-sequence .phase {
+      display: grid;
+      gap: .35rem;
+      padding: .8rem;
+      background: color-mix(in srgb, var(--viz-series-1) 8%, transparent);
+    }
+    #vllm-source-atlas .mini-sequence .phase:nth-of-type(3) { background: color-mix(in srgb, var(--viz-series-2) 9%, transparent); }
+    #vllm-source-atlas .mini-sequence .phase:nth-of-type(5) { background: color-mix(in srgb, var(--viz-series-3) 9%, transparent); }
+    #vllm-source-atlas .mini-sequence strong,
+    #vllm-source-atlas .mini-sequence span { display: block; }
+    #vllm-source-atlas .mini-sequence span { color: var(--muted-foreground); }
+    #vllm-source-atlas .sim-controls { display: flex; flex-wrap: wrap; gap: .75rem; align-items: end; }
+    #vllm-source-atlas .sim-controls .form-label { min-width: 9rem; }
+    #vllm-source-atlas .sim-controls output { color: var(--foreground); }
+    #vllm-source-atlas .stage-controls { display: flex; flex-wrap: wrap; gap: .35rem; }
+    #vllm-source-atlas .sim-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    #vllm-source-atlas .sim-summary .card { min-height: 7.2rem; }
+    #vllm-source-atlas .viz-stat-value { overflow-wrap: anywhere; }
+    #vllm-source-atlas .block-section { display: grid; gap: .65rem; }
+    #vllm-source-atlas .block-section h3 { margin: 0; }
+    #vllm-source-atlas .logical-blocks,
+    #vllm-source-atlas .physical-pool { display: grid; grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)); gap: .45rem; }
+    #vllm-source-atlas .empty-state { grid-column: 1 / -1; margin: 0; padding: .75rem; border: 1px dashed var(--border); border-radius: .65rem; color: var(--muted-foreground); background: color-mix(in srgb, var(--muted) 40%, transparent); }
+    #vllm-source-atlas .kv-block {
+      min-height: 6.4rem;
+      padding: .65rem;
+      display: grid;
+      gap: .35rem;
+      align-content: start;
+      background: color-mix(in srgb, var(--muted) 62%, transparent);
+    }
+    #vllm-source-atlas .kv-block.active { background: color-mix(in srgb, var(--viz-series-1) 15%, transparent); }
+    #vllm-source-atlas .kv-block.cached { background: color-mix(in srgb, var(--viz-series-2) 15%, transparent); }
+    #vllm-source-atlas .kv-block.shared { background: color-mix(in srgb, var(--viz-series-3) 16%, transparent); }
+    #vllm-source-atlas .kv-block .block-top { display: flex; justify-content: space-between; gap: .4rem; }
+    #vllm-source-atlas .kv-block .tokens { color: var(--muted-foreground); overflow-wrap: anywhere; }
+    #vllm-source-atlas .token-meter { display: grid; grid-template-columns: repeat(var(--cols), 1fr); gap: 2px; }
+    #vllm-source-atlas .token-dot { height: .35rem; background: var(--border); }
+    #vllm-source-atlas .token-dot.filled { background: var(--viz-series-1); }
+    #vllm-source-atlas .token-dot.hit { background: var(--viz-series-3); }
+    #vllm-source-atlas .mapping-table { width: 100%; border-collapse: collapse; }
+    #vllm-source-atlas .mapping-table th,
+    #vllm-source-atlas .mapping-table td { text-align: left; padding: .55rem .35rem; border-bottom: 1px solid var(--border); }
+    #vllm-source-atlas .mapping-table th { color: var(--muted-foreground); }
+    #vllm-source-atlas .legend { display: flex; gap: .8rem; flex-wrap: wrap; color: var(--muted-foreground); }
+    #vllm-source-atlas .legend span { display: inline-flex; align-items: center; gap: .3rem; }
+    #vllm-source-atlas .swatch { width: .75rem; height: .75rem; background: var(--muted); }
+    #vllm-source-atlas .swatch.active { background: var(--viz-series-1); }
+    #vllm-source-atlas .swatch.cached { background: var(--viz-series-2); }
+    #vllm-source-atlas .swatch.shared { background: var(--viz-series-3); }
+    #vllm-source-atlas .cache-layers {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: .55rem;
+    }
+    #vllm-source-atlas .cache-layer { display: grid; gap: .4rem; padding: .75rem; background: color-mix(in srgb, var(--muted) 55%, transparent); }
+    #vllm-source-atlas .cache-layer h3,
+    #vllm-source-atlas .cache-layer p { margin: 0; }
+    #vllm-source-atlas .cache-layer p { color: var(--muted-foreground); }
+    #vllm-source-atlas .calc-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    #vllm-source-atlas .calc-results { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    #vllm-source-atlas .formula { overflow-wrap: anywhere; }
+    #vllm-source-atlas .myths { display: grid; gap: .5rem; }
+    #vllm-source-atlas details { padding: .8rem 0; border-bottom: 1px solid var(--border); }
+    #vllm-source-atlas details summary { cursor: pointer; font-weight: 500; }
+    #vllm-source-atlas details p { color: var(--muted-foreground); margin-bottom: 0; }
+    #vllm-source-atlas .source-list { display: grid; gap: .4rem; }
+    #vllm-source-atlas .source-row {
+      display: grid;
+      grid-template-columns: minmax(10rem, 1.2fr) minmax(8rem, .8fr) 2fr;
+      gap: .7rem;
+      align-items: baseline;
+      padding: .65rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+    #vllm-source-atlas .source-row span { color: var(--muted-foreground); }
+    #vllm-source-atlas .footer-note { color: var(--muted-foreground); margin: 0; }
+    @media (max-width: 700px) {
+      #vllm-source-atlas .takeaways,
+      #vllm-source-atlas .kv-why,
+      #vllm-source-atlas .sim-summary,
+      #vllm-source-atlas .calc-grid,
+      #vllm-source-atlas .calc-results { grid-template-columns: 1fr; }
+      #vllm-source-atlas .architecture { grid-template-columns: 1fr; }
+      #vllm-source-atlas .arch-arrow { grid-template-columns: auto auto; justify-content: center; }
+      #vllm-source-atlas .return-line { grid-template-columns: 1fr; text-align: center; }
+      #vllm-source-atlas .return-line .line { display: none; }
+      #vllm-source-atlas .flow-layout { grid-template-columns: 1fr; }
+      #vllm-source-atlas .flow-detail { position: static; }
+      #vllm-source-atlas .loop,
+      #vllm-source-atlas .cache-layers { grid-template-columns: 1fr 1fr; }
+      #vllm-source-atlas .mini-sequence { grid-template-columns: 1fr; }
+      #vllm-source-atlas .mini-sequence &gt; span { text-align: center; }
+      #vllm-source-atlas .source-row { grid-template-columns: 1fr; gap: .2rem; }
+    }
+    @media (max-width: 430px) {
+      #vllm-source-atlas .loop,
+      #vllm-source-atlas .cache-layers { grid-template-columns: 1fr; }
+      #vllm-source-atlas .flow-step { grid-template-columns: 1.8rem 1fr; }
+      #vllm-source-atlas .flow-step &gt; code { grid-column: 2; }
+      #vllm-source-atlas .detail-row { grid-template-columns: 1fr; gap: .15rem; }
+    }
+  &lt;/style&gt;
+
+  &lt;header class=&quot;hero&quot;&gt;
+    &lt;div class=&quot;eyebrow&quot;&gt;
+      &lt;span class=&quot;viz-badge&quot;&gt;源码导读&lt;/span&gt;
+      &lt;code&gt;releases/v0.25.0&lt;/code&gt;
+      &lt;code&gt;702f4814fe54&lt;/code&gt;
+      &lt;span&gt;基线：decoder-only · 单 DP · Model Runner V1 · 同步调度 · 无投机解码 · 本地 KV&lt;/span&gt;
+    &lt;/div&gt;
+    &lt;h1&gt;一条请求，如何穿过 vLLM&lt;/h1&gt;
+    &lt;p class=&quot;lede&quot;&gt;从 &lt;code&gt;POST /v1/chat/completions&lt;/code&gt; 追到调度、GPU forward、Paged KV 写入，再沿输出队列返回 SSE。重点把“预分配显存、Block ID、Block Table、Slot Mapping、Prefix Cache”五个容易混淆的概念拆开。&lt;/p&gt;
+    &lt;nav class=&quot;quick-nav&quot; aria-label=&quot;章节导航&quot;&gt;
+      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#architecture&quot;&gt;进程架构&lt;/a&gt;
+      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#request-flow&quot;&gt;请求调用链&lt;/a&gt;
+      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#kv-basics&quot;&gt;KV 原理&lt;/a&gt;
+      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#kv-simulator&quot;&gt;分页模拟器&lt;/a&gt;
+      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#memory&quot;&gt;显存计算&lt;/a&gt;
+      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#sources&quot;&gt;源码索引&lt;/a&gt;
+    &lt;/nav&gt;
+  &lt;/header&gt;
+
+  &lt;section class=&quot;section&quot;&gt;
+    &lt;div class=&quot;viz-grid takeaways&quot;&gt;
+      &lt;article class=&quot;card takeaway&quot;&gt;&lt;span class=&quot;n&quot;&gt;01 · 同步基线的一轮&lt;/span&gt;&lt;p&gt;&lt;code&gt;EngineCore.step()&lt;/code&gt; 的核心顺序是：&lt;strong&gt;schedule → execute_model → update_from_output&lt;/strong&gt;。默认异步调度会改走 batch queue，把这些阶段跨批次重叠。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;card takeaway&quot;&gt;&lt;span class=&quot;n&quot;&gt;02 · KV 不逐请求 malloc&lt;/span&gt;&lt;p&gt;GPU 启动时先开一整池 KV tensor；请求期间分配的是&lt;strong&gt;页号 / Block ID&lt;/strong&gt;，不是重新申请 CUDA 显存。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;card takeaway&quot;&gt;&lt;span class=&quot;n&quot;&gt;03 · PagedAttention 的关键&lt;/span&gt;&lt;p&gt;&lt;strong&gt;Block Table&lt;/strong&gt; 负责读哪些物理页；&lt;strong&gt;Slot Mapping&lt;/strong&gt; 负责把本轮 K/V 写进哪个扁平槽位。&lt;/p&gt;&lt;/article&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;section&quot; id=&quot;architecture&quot;&gt;
+    &lt;div class=&quot;section-head&quot;&gt;
+      &lt;h2&gt;1. 先看进程边界&lt;/h2&gt;
+      &lt;p&gt;在线 serving 中，API 前端与 EngineCore 默认分进程；EngineCore 持有调度器和 KV 的“账本”，GPU Worker 持有模型权重与真正的 KV tensors。单 GPU 的默认 &lt;code&gt;UniProcExecutor&lt;/code&gt; 会让 Worker 运行在 EngineCore 进程内；多卡 &lt;code&gt;mp&lt;/code&gt; 后端才通常为每个 GPU 启动独立 Worker 进程。&lt;/p&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;architecture&quot; role=&quot;img&quot; aria-label=&quot;请求从 API Server 经 ZMQ 到 EngineCore，再由 Executor 调用 GPU Worker；单 GPU 时 Worker 与 Core 同进程，多 GPU 时通常为独立进程&quot;&gt;
+      &lt;article class=&quot;arch-node api&quot;&gt;
+        &lt;span class=&quot;viz-badge&quot;&gt;进程 A&lt;/span&gt;
+        &lt;h3&gt;API Server / AsyncLLM&lt;/h3&gt;
+        &lt;p&gt;FastAPI 路由、chat template、tokenize、SamplingParams、按请求维护输出队列与 detokenizer。&lt;/p&gt;
+        &lt;code&gt;vllm/entrypoints/openai&lt;/code&gt;
+      &lt;/article&gt;
+      &lt;div class=&quot;arch-arrow&quot;&gt;&lt;strong&gt;ADD&lt;/strong&gt;&lt;span&gt;msgpack · ZMQ →&lt;/span&gt;&lt;/div&gt;
+      &lt;article class=&quot;arch-node engine&quot;&gt;
+        &lt;span class=&quot;viz-badge&quot;&gt;进程 B&lt;/span&gt;
+        &lt;h3&gt;EngineCore&lt;/h3&gt;
+        &lt;p&gt;Scheduler、Request 状态、KV BlockPool、prefix hash 索引；持续拼 continuous batch。&lt;/p&gt;
+        &lt;code&gt;vllm/v1/engine/core.py&lt;/code&gt;
+      &lt;/article&gt;
+      &lt;div class=&quot;arch-arrow&quot;&gt;&lt;strong&gt;batch&lt;/strong&gt;&lt;span&gt;Executor →&lt;/span&gt;&lt;/div&gt;
+      &lt;article class=&quot;arch-node worker&quot;&gt;
+        &lt;span class=&quot;viz-badge&quot;&gt;单卡在进程 B 内 · 多卡通常每 GPU 一进程&lt;/span&gt;
+        &lt;h3&gt;GPU Worker&lt;/h3&gt;
+        &lt;p&gt;维护 persistent batch / block table，执行模型 forward、KV scatter write、attention 与 sampling。&lt;/p&gt;
+        &lt;code&gt;vllm/v1/worker&lt;/code&gt;
+      &lt;/article&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;return-line&quot; aria-label=&quot;输出反向返回&quot;&gt;
+      &lt;div class=&quot;line&quot;&gt;&lt;/div&gt;&lt;span&gt;← SSE / JSON&lt;/span&gt;&lt;div class=&quot;line&quot;&gt;&lt;/div&gt;&lt;span&gt;← EngineCoreOutputs / ZMQ&lt;/span&gt;&lt;div class=&quot;line&quot;&gt;&lt;/div&gt;
+    &lt;/div&gt;
+    &lt;p class=&quot;scope-note&quot;&gt;边界说明：v0.25.0 对大多数受支持的非 MoE 生成模型会默认选择 Model Runner V2，并在配置兼容时默认启用异步调度。API → EngineCore → Scheduler 的主干不变，但 Worker 内部数据结构与 EngineCore 的批次推进方式会不同。本文固定 &lt;code&gt;VLLM_USE_V2_MODEL_RUNNER=0&lt;/code&gt; 与 &lt;code&gt;--no-async-scheduling&lt;/code&gt;，用 V1 GPUModelRunner 的同步路径讲清分页机制。&lt;/p&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;section&quot; id=&quot;request-flow&quot;&gt;
+    &lt;div class=&quot;section-head&quot;&gt;
+      &lt;h2&gt;2. 一条 Chat 请求的源码调用链&lt;/h2&gt;
+      &lt;p&gt;点击任一步，右侧会显示它拿到什么、做什么、交给谁，以及固定到 commit 的源码行。&lt;/p&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;flow-layout&quot;&gt;
+      &lt;div class=&quot;flow-list&quot; id=&quot;flow-list&quot; aria-label=&quot;请求处理步骤&quot;&gt;&lt;/div&gt;
+      &lt;aside class=&quot;card flow-detail&quot; aria-live=&quot;polite&quot;&gt;
+        &lt;span class=&quot;viz-badge&quot; id=&quot;flow-layer&quot;&gt;&lt;/span&gt;
+        &lt;h3 id=&quot;flow-title&quot;&gt;&lt;/h3&gt;
+        &lt;p id=&quot;flow-what&quot;&gt;&lt;/p&gt;
+        &lt;div class=&quot;detail-meta&quot;&gt;
+          &lt;div class=&quot;detail-row&quot;&gt;&lt;span&gt;入口&lt;/span&gt;&lt;code id=&quot;flow-symbol&quot;&gt;&lt;/code&gt;&lt;/div&gt;
+          &lt;div class=&quot;detail-row&quot;&gt;&lt;span&gt;输入&lt;/span&gt;&lt;span id=&quot;flow-input&quot;&gt;&lt;/span&gt;&lt;/div&gt;
+          &lt;div class=&quot;detail-row&quot;&gt;&lt;span&gt;输出&lt;/span&gt;&lt;span id=&quot;flow-output&quot;&gt;&lt;/span&gt;&lt;/div&gt;
+          &lt;div class=&quot;detail-row&quot;&gt;&lt;span&gt;源码&lt;/span&gt;&lt;a id=&quot;flow-source&quot; target=&quot;_blank&quot; rel=&quot;noreferrer&quot;&gt;打开对应行&lt;/a&gt;&lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/aside&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;loop&quot; role=&quot;img&quot; aria-label=&quot;EngineCore 每轮 schedule execute update output 的循环&quot;&gt;
+      &lt;article class=&quot;loop-cell active&quot;&gt;&lt;span&gt;①&lt;/span&gt;&lt;h3&gt;Scheduler.schedule&lt;/h3&gt;&lt;p&gt;从 RUNNING 再到 WAITING；算 token budget、prefix hit、所需 Block IDs。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;loop-cell&quot;&gt;&lt;span&gt;②&lt;/span&gt;&lt;h3&gt;execute_model&lt;/h3&gt;&lt;p&gt;Worker 更新 persistent batch 和 block table，准备 input_ids / positions / slot mapping。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;loop-cell active&quot;&gt;&lt;span&gt;③&lt;/span&gt;&lt;h3&gt;Model + Attention&lt;/h3&gt;&lt;p&gt;逐层产生 Q/K/V；K/V scatter 到分页缓存；attention 通过 block table 读历史页。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;loop-cell&quot;&gt;&lt;span&gt;④&lt;/span&gt;&lt;h3&gt;update_from_output&lt;/h3&gt;&lt;p&gt;接收 token，更新 num_computed_tokens / stop 状态；完成请求释放引用并产生输出。&lt;/p&gt;&lt;/article&gt;
+    &lt;/div&gt;
+    &lt;p class=&quot;loop-caption&quot;&gt;continuous batching 就发生在这个循环：每一轮都可把新请求的 prefill、旧请求的 decode、分块 prefill 拼进同一份 token budget；调度器源码明确说明它不把请求硬分成“prefill 队列”和“decode 队列”。&lt;/p&gt;
+    &lt;p class=&quot;scope-note&quot;&gt;默认异步调度下，&lt;code&gt;EngineCore.step_with_batch_queue()&lt;/code&gt; 会先填充 batch queue，再按完成顺序取回结果并调用 &lt;code&gt;update_from_output()&lt;/code&gt;；上图表达的是单个批次的逻辑阶段，不表示默认路径必须在一次函数调用内串行完成。&lt;/p&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;section&quot; id=&quot;kv-basics&quot;&gt;
+    &lt;div class=&quot;section-head&quot;&gt;
+      &lt;h2&gt;3. KV Cache 到底缓存了什么&lt;/h2&gt;
+      &lt;p&gt;自回归注意力中，历史 token 的 K/V 会被以后所有 token 反复使用；历史 Q 只用于它自己当时那次查询，之后不再需要。&lt;/p&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;viz-grid kv-why&quot;&gt;
+      &lt;article class=&quot;card&quot;&gt;&lt;h3&gt;Q：当前问题&lt;/h3&gt;&lt;p&gt;每一步只需要当前待计算 token 的 Query 去“问”所有历史 K。历史 Q 不参与未来步骤，所以不缓存。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;card&quot;&gt;&lt;h3&gt;K：可匹配的索引&lt;/h3&gt;&lt;p&gt;每个历史 token 的 Key 必须留下，未来 Query 要计算 &lt;code&gt;Q · Kᵀ&lt;/code&gt; 来得到注意力权重。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;card&quot;&gt;&lt;h3&gt;V：可取回的内容&lt;/h3&gt;&lt;p&gt;权重得到后，要对历史 Value 做加权求和。K 与 V 因此按层、按 token 一起增长。&lt;/p&gt;&lt;/article&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;mini-sequence&quot; role=&quot;img&quot; aria-label=&quot;prefill 生成首 token，下一轮 decode 才把该 token 写入 KV&quot;&gt;
+      &lt;div class=&quot;phase&quot;&gt;&lt;strong&gt;Prefill&lt;/strong&gt;&lt;span&gt;计算 prompt 的全部 K/V，最后一个 prompt 位置的 logits 采样出 T₁。&lt;/span&gt;&lt;/div&gt;
+      &lt;span&gt;→&lt;/span&gt;
+      &lt;div class=&quot;phase&quot;&gt;&lt;strong&gt;Decode step 1&lt;/strong&gt;&lt;span&gt;把 T₁ 当输入，写入 K/V(T₁)，再从 logits 采样 T₂。&lt;/span&gt;&lt;/div&gt;
+      &lt;span&gt;→&lt;/span&gt;
+      &lt;div class=&quot;phase&quot;&gt;&lt;strong&gt;Decode step 2&lt;/strong&gt;&lt;span&gt;写入 K/V(T₂)，采样 T₃；如此循环。&lt;/span&gt;&lt;/div&gt;
+    &lt;/div&gt;
+    &lt;p class=&quot;scope-note&quot;&gt;容易忽略：刚采样出的 token 还没有经过模型，因此它的 KV 要到下一轮才写入。Scheduler 用 &lt;code&gt;num_computed_tokens&lt;/code&gt; 追赶 &lt;code&gt;num_tokens_with_spec&lt;/code&gt;，正好统一了 prefill、decode、chunked prefill 和 speculative decode。&lt;/p&gt;
+    &lt;div class=&quot;cache-layers&quot; role=&quot;img&quot; aria-label=&quot;KV 管理四层抽象&quot;&gt;
+      &lt;article class=&quot;cache-layer&quot;&gt;&lt;span class=&quot;viz-badge&quot;&gt;GPU bytes&lt;/span&gt;&lt;h3&gt;KV Tensor Pool&lt;/h3&gt;&lt;p&gt;启动时一次性按可用显存创建。每层都有按 page 排列的 K/V tensor view。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;cache-layer&quot;&gt;&lt;span class=&quot;viz-badge&quot;&gt;整数页号&lt;/span&gt;&lt;h3&gt;BlockPool&lt;/h3&gt;&lt;p&gt;管理 Block ID、ref_cnt、free queue、hash → block 映射；这里只是 CPU 侧账本。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;cache-layer&quot;&gt;&lt;span class=&quot;viz-badge&quot;&gt;读路径&lt;/span&gt;&lt;h3&gt;Block Table&lt;/h3&gt;&lt;p&gt;每个请求的逻辑块序号 → 物理 Block ID。历史 KV 可以离散分布。&lt;/p&gt;&lt;/article&gt;
+      &lt;article class=&quot;cache-layer&quot;&gt;&lt;span class=&quot;viz-badge&quot;&gt;写路径&lt;/span&gt;&lt;h3&gt;Slot Mapping&lt;/h3&gt;&lt;p&gt;&lt;code&gt;slot = physical_block_id × block_size + offset&lt;/code&gt;，本轮每个 token 一个槽位。&lt;/p&gt;&lt;/article&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;section&quot; id=&quot;kv-simulator&quot;&gt;
+    &lt;div class=&quot;section-head&quot;&gt;
+      &lt;h2&gt;4. Paged KV Cache 交互模拟&lt;/h2&gt;
+      &lt;p&gt;调节 prompt 长度和 block size，再切换生命周期。示例物理页号故意是离散的，用来强调“连续 token 不要求连续显存”。&lt;/p&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;viz-controls sim-controls&quot;&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;prompt-len&quot;&gt;Prompt tokens：&lt;output id=&quot;prompt-len-out&quot;&gt;35&lt;/output&gt;
+        &lt;input class=&quot;form-range&quot; id=&quot;prompt-len&quot; type=&quot;range&quot; min=&quot;5&quot; max=&quot;64&quot; value=&quot;35&quot;&gt;
+      &lt;/label&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;block-size&quot;&gt;Block size
+        &lt;select class=&quot;form-select&quot; id=&quot;block-size&quot;&gt;
+          &lt;option value=&quot;4&quot;&gt;4 tokens&lt;/option&gt;
+          &lt;option value=&quot;8&quot;&gt;8 tokens&lt;/option&gt;
+          &lt;option value=&quot;16&quot; selected&gt;16 tokens&lt;/option&gt;
+        &lt;/select&gt;
+      &lt;/label&gt;
+      &lt;div class=&quot;stage-controls&quot; aria-label=&quot;生命周期阶段&quot;&gt;
+        &lt;button class=&quot;btn&quot; type=&quot;button&quot; data-stage=&quot;prefill&quot; aria-pressed=&quot;true&quot;&gt;首次 prefill&lt;/button&gt;
+        &lt;button class=&quot;btn&quot; type=&quot;button&quot; data-stage=&quot;decode&quot; aria-pressed=&quot;false&quot;&gt;decode 一步&lt;/button&gt;
+        &lt;button class=&quot;btn&quot; type=&quot;button&quot; data-stage=&quot;finish&quot; aria-pressed=&quot;false&quot;&gt;请求结束&lt;/button&gt;
+        &lt;button class=&quot;btn&quot; type=&quot;button&quot; data-stage=&quot;reuse&quot; aria-pressed=&quot;false&quot;&gt;同前缀新请求&lt;/button&gt;
+      &lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;viz-grid sim-summary&quot;&gt;
+      &lt;article class=&quot;card viz-stat&quot;&gt;&lt;span class=&quot;text-muted&quot;&gt;本阶段已计算 KV&lt;/span&gt;&lt;span class=&quot;viz-stat-value&quot; id=&quot;computed-value&quot;&gt;35 tokens&lt;/span&gt;&lt;span class=&quot;text-muted&quot; id=&quot;computed-context&quot;&gt;&lt;/span&gt;&lt;/article&gt;
+      &lt;article class=&quot;card viz-stat&quot;&gt;&lt;span class=&quot;text-muted&quot;&gt;Prefix cache 命中&lt;/span&gt;&lt;span class=&quot;viz-stat-value&quot; id=&quot;hit-value&quot;&gt;0 tokens&lt;/span&gt;&lt;span class=&quot;text-muted&quot; id=&quot;hit-context&quot;&gt;&lt;/span&gt;&lt;/article&gt;
+      &lt;article class=&quot;card viz-stat&quot;&gt;&lt;span class=&quot;text-muted&quot;&gt;当前 Block Table&lt;/span&gt;&lt;span class=&quot;viz-stat-value&quot; id=&quot;table-value&quot;&gt;[7, 2, 11]&lt;/span&gt;&lt;span class=&quot;text-muted&quot;&gt;逻辑块 → 物理页&lt;/span&gt;&lt;/article&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;block-section&quot;&gt;
+      &lt;h3&gt;请求视角：逻辑块&lt;/h3&gt;
+      &lt;div class=&quot;logical-blocks&quot; id=&quot;logical-blocks&quot;&gt;&lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;block-section&quot;&gt;
+      &lt;h3&gt;GPU 池视角：物理页&lt;/h3&gt;
+      &lt;div class=&quot;physical-pool&quot; id=&quot;physical-pool&quot;&gt;&lt;/div&gt;
+      &lt;div class=&quot;legend&quot; aria-label=&quot;状态图例&quot;&gt;
+        &lt;span&gt;&lt;i class=&quot;swatch active&quot;&gt;&lt;/i&gt;当前请求占用&lt;/span&gt;
+        &lt;span&gt;&lt;i class=&quot;swatch cached&quot;&gt;&lt;/i&gt;ref=0 但可复用 / 可驱逐&lt;/span&gt;
+        &lt;span&gt;&lt;i class=&quot;swatch shared&quot;&gt;&lt;/i&gt;prefix hit 后共享&lt;/span&gt;
+        &lt;span&gt;&lt;i class=&quot;swatch&quot;&gt;&lt;/i&gt;空闲&lt;/span&gt;
+      &lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;block-section&quot;&gt;
+      &lt;h3&gt;最后一个已计算 token 的地址换算&lt;/h3&gt;
+      &lt;table class=&quot;mapping-table&quot;&gt;
+        &lt;thead&gt;&lt;tr&gt;&lt;th&gt;position&lt;/th&gt;&lt;th&gt;logical block&lt;/th&gt;&lt;th&gt;physical block&lt;/th&gt;&lt;th&gt;offset&lt;/th&gt;&lt;th&gt;flat slot&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;
+        &lt;tbody&gt;&lt;tr&gt;&lt;td id=&quot;map-pos&quot;&gt;&lt;/td&gt;&lt;td id=&quot;map-logical&quot;&gt;&lt;/td&gt;&lt;td id=&quot;map-physical&quot;&gt;&lt;/td&gt;&lt;td id=&quot;map-offset&quot;&gt;&lt;/td&gt;&lt;td&gt;&lt;code id=&quot;map-slot&quot;&gt;&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;
+      &lt;/table&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;myths&quot;&gt;
+      &lt;details open&gt;&lt;summary&gt;请求结束后，KV 是“释放”还是“缓存”？&lt;/summary&gt;&lt;p&gt;两者可以同时成立。&lt;code&gt;ref_cnt&lt;/code&gt; 降到 0 后，页回到 free queue；如果它有 full-block hash，内容仍可被 prefix cache 命中，同时它也是可驱逐候选。新分配拿到它时才删 hash、覆盖物理内容。&lt;/p&gt;&lt;/details&gt;
+      &lt;details&gt;&lt;summary&gt;为什么只缓存 full block？&lt;/summary&gt;&lt;p&gt;完整块才有稳定的链式 hash 边界，也便于多请求共享同一页。partial block 仍可被当前请求继续写，但通常不进入可复用 hash 索引。&lt;/p&gt;&lt;/details&gt;
+      &lt;details&gt;&lt;summary&gt;为什么 100% prompt 命中还要重算最后一个 token？&lt;/summary&gt;&lt;p&gt;KV 只能让 attention 跳过历史计算，却不能凭空提供“下一个 token”的 logits。v0.25.0 把最大命中长度限制为 &lt;code&gt;prompt_length - 1&lt;/code&gt;；受 block 对齐限制，可能重算最后一整块。&lt;/p&gt;&lt;/details&gt;
+    &lt;/div&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;section&quot; id=&quot;memory&quot;&gt;
+    &lt;div class=&quot;section-head&quot;&gt;
+      &lt;h2&gt;5. KV Cache 显存计算器&lt;/h2&gt;
+      &lt;p&gt;输入“本 GPU 实际持有”的注意力层数与 KV heads，避免 TP / PP 的切分与复制规则干扰基本公式。&lt;/p&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;viz-grid calc-grid&quot;&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;calc-layers&quot;&gt;本 GPU 注意力层数&lt;input class=&quot;form-control&quot; id=&quot;calc-layers&quot; type=&quot;number&quot; min=&quot;1&quot; value=&quot;32&quot;&gt;&lt;/label&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;calc-heads&quot;&gt;本 GPU KV heads&lt;input class=&quot;form-control&quot; id=&quot;calc-heads&quot; type=&quot;number&quot; min=&quot;1&quot; value=&quot;8&quot;&gt;&lt;/label&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;calc-dim&quot;&gt;Head dim&lt;input class=&quot;form-control&quot; id=&quot;calc-dim&quot; type=&quot;number&quot; min=&quot;1&quot; value=&quot;128&quot;&gt;&lt;/label&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;calc-bytes&quot;&gt;每元素 bytes&lt;select class=&quot;form-select&quot; id=&quot;calc-bytes&quot;&gt;&lt;option value=&quot;2&quot; selected&gt;2 · BF16/FP16&lt;/option&gt;&lt;option value=&quot;1&quot;&gt;1 · FP8/INT8（近似）&lt;/option&gt;&lt;option value=&quot;4&quot;&gt;4 · FP32&lt;/option&gt;&lt;/select&gt;&lt;/label&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;calc-block&quot;&gt;Block size&lt;input class=&quot;form-control&quot; id=&quot;calc-block&quot; type=&quot;number&quot; min=&quot;1&quot; value=&quot;16&quot;&gt;&lt;/label&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;calc-tokens&quot;&gt;序列 tokens&lt;input class=&quot;form-control&quot; id=&quot;calc-tokens&quot; type=&quot;number&quot; min=&quot;1&quot; value=&quot;4096&quot;&gt;&lt;/label&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;viz-grid calc-results&quot;&gt;
+      &lt;article class=&quot;card viz-stat&quot;&gt;&lt;span class=&quot;text-muted&quot;&gt;每 token / 本 GPU&lt;/span&gt;&lt;span class=&quot;viz-stat-value&quot; id=&quot;per-token&quot;&gt;128 KiB&lt;/span&gt;&lt;span class=&quot;text-muted&quot;&gt;所有本地层的 K + V&lt;/span&gt;&lt;/article&gt;
+      &lt;article class=&quot;card viz-stat&quot;&gt;&lt;span class=&quot;text-muted&quot;&gt;每 page / 本 GPU&lt;/span&gt;&lt;span class=&quot;viz-stat-value&quot; id=&quot;per-page&quot;&gt;2 MiB&lt;/span&gt;&lt;span class=&quot;text-muted&quot; id=&quot;page-context&quot;&gt;16 tokens&lt;/span&gt;&lt;/article&gt;
+      &lt;article class=&quot;card viz-stat&quot;&gt;&lt;span class=&quot;text-muted&quot;&gt;分页容量 / 本 GPU&lt;/span&gt;&lt;span class=&quot;viz-stat-value&quot; id=&quot;sequence-size&quot;&gt;512 MiB&lt;/span&gt;&lt;span class=&quot;text-muted&quot; id=&quot;sequence-context&quot;&gt;有效数据 512 MiB · 256 pages · 尾页 0 空槽&lt;/span&gt;&lt;/article&gt;
+    &lt;/div&gt;
+    &lt;p class=&quot;formula&quot;&gt;&lt;code&gt;bytes_per_token = 2(K,V) × local_layers × local_kv_heads × head_dim × dtype_bytes&lt;/code&gt;&lt;/p&gt;
+    &lt;p class=&quot;scope-note&quot;&gt;源码的单层 &lt;code&gt;AttentionSpec.real_page_size_bytes&lt;/code&gt; 正是 2 × block_size × num_kv_heads × head_size × dtype_size。这里的“分页容量”按完整 page 取整，是该序列关联的池容量，不代表请求到来时新增 malloc；GPU KV tensor pool 已在启动阶段预分配。量化 KV、MLA、滑窗、Mamba、混合层与 page padding 会改变真实值，计算器用于标准 full-attention 基线。&lt;/p&gt;
+  &lt;/section&gt;
+
+  &lt;section class=&quot;section&quot; id=&quot;sources&quot;&gt;
+    &lt;div class=&quot;section-head&quot;&gt;
+      &lt;h2&gt;6. 源码索引：按阅读顺序&lt;/h2&gt;
+      &lt;p&gt;链接固定到本次分析时 &lt;code&gt;releases/v0.25.0&lt;/code&gt; 的 commit &lt;code&gt;702f4814fe54fabff350d43cb753ae3e47c0c276&lt;/code&gt;。&lt;/p&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;source-list&quot; id=&quot;source-list&quot;&gt;&lt;/div&gt;
+    &lt;p class=&quot;footer-note&quot;&gt;建议阅读顺序：先看 &lt;code&gt;core.py:run_busy_loop&lt;/code&gt; 与同步基线的 &lt;code&gt;step&lt;/code&gt;，再对照默认异步路径的 &lt;code&gt;step_with_batch_queue&lt;/code&gt;；之后读 &lt;code&gt;scheduler.py:schedule&lt;/code&gt;，最后用 &lt;code&gt;block_table.py&lt;/code&gt; 和 attention backend 把 CPU 侧页号对应到 GPU 侧真实写入。&lt;/p&gt;
+  &lt;/section&gt;
+
+  &lt;script&gt;
+    (() =&gt; {
+      const root = document.getElementById(&#x27;vllm-source-atlas&#x27;);
+      const commit = &#x27;702f4814fe54fabff350d43cb753ae3e47c0c276&#x27;;
+      const repo = `https://github.com/vllm-project/vllm/blob/${commit}/`;
+      const src = (file, start, end) =&gt; `${repo}${file}#L${start}-L${end}`;
+
+      const steps = [
+        { layer: &#x27;HTTP / FastAPI&#x27;, title: &#x27;路由接住 OpenAI 请求&#x27;, symbol: &#x27;create_chat_completion()&#x27;, file: &#x27;vllm/entrypoints/openai/chat_completion/api_router.py&#x27;, lines: [40, 74], what: &#x27;校验 JSON，取得 OpenAIServingChat handler。handler 返回普通响应或异步生成器；流式场景包成 text/event-stream。&#x27;, input: &#x27;ChatCompletionRequest + Starlette Request&#x27;, output: &#x27;ChatCompletionResponse 或 StreamingResponse&#x27; },
+        { layer: &#x27;OpenAI Serving / Renderer&#x27;, title: &#x27;Chat template + tokenize&#x27;, symbol: &#x27;_create_chat_completion()&#x27;, file: &#x27;vllm/entrypoints/openai/chat_completion/serving.py&#x27;, lines: [249, 371], what: &#x27;调用 render_chat_request 把 messages 渲染成模型输入，得到 prompt token ids；随后生成 request_id，校验 max tokens，并把 OpenAI 参数转换成 SamplingParams。&#x27;, input: &#x27;messages、tools、chat template、采样字段&#x27;, output: &#x27;EngineInput + SamplingParams&#x27; },
+        { layer: &#x27;AsyncLLM&#x27;, title: &#x27;创建逐请求输出队列&#x27;, symbol: &#x27;AsyncLLM.generate()&#x27;, file: &#x27;vllm/v1/engine/async_llm.py&#x27;, lines: [524, 586], what: &#x27;generate 先 add_request，再持续从 RequestOutputCollector 取结果并 yield。断连或生成器被销毁时会 abort。&#x27;, input: &#x27;EngineInput、SamplingParams、request_id&#x27;, output: &#x27;AsyncGenerator[RequestOutput]&#x27; },
+        { layer: &#x27;InputProcessor&#x27;, title: &#x27;组装 EngineCoreRequest&#x27;, symbol: &#x27;InputProcessor.process_inputs()&#x27;, file: &#x27;vllm/v1/engine/input_processor.py&#x27;, lines: [242, 385], what: &#x27;验证参数与模型输入，抽出 prompt_token_ids，补齐 EOS / generation config，构造可序列化的 EngineCoreRequest。&#x27;, input: &#x27;已渲染 EngineInput&#x27;, output: &#x27;EngineCoreRequest&#x27; },
+        { layer: &#x27;进程通信&#x27;, title: &#x27;API 进程把 ADD 发给 Core&#x27;, symbol: &#x27;add_request_async()&#x27;, file: &#x27;vllm/v1/engine/core_client.py&#x27;, lines: [1121, 1124], what: &#x27;设置 client_index，把 EngineCoreRequest 编码后通过异步 ZMQ 发给 EngineCore，并确保输出接收任务已启动。&#x27;, input: &#x27;EngineCoreRequest&#x27;, output: &#x27;ZMQ ADD message&#x27; },
+        { layer: &#x27;EngineCore 输入线程&#x27;, title: &#x27;反序列化并创建 Request&#x27;, symbol: &#x27;process_input_sockets()&#x27;, file: &#x27;vllm/v1/engine/core.py&#x27;, lines: [1484, 1587], what: &#x27;输入线程解码 ADD；preprocess_add_request 把 EngineCoreRequest 变成内部 Request，同时计算完整 token blocks 的链式 hash。&#x27;, input: &#x27;msgpack frames&#x27;, output: &#x27;Request → input_queue&#x27; },
+        { layer: &#x27;Scheduler&#x27;, title: &#x27;进入 WAITING 队列&#x27;, symbol: &#x27;Scheduler.add_request()&#x27;, file: &#x27;vllm/v1/core/sched/scheduler.py&#x27;, lines: [2012, 2034], what: &#x27;请求写入 requests 字典与 waiting 队列。此时尚未占用新的 KV 页，真正分配发生在下一次 schedule。&#x27;, input: &#x27;Request(status=WAITING)&#x27;, output: &#x27;waiting queue + request registry&#x27; },
+        { layer: &#x27;EngineCore 同步基线&#x27;, title: &#x27;schedule → execute → update&#x27;, symbol: &#x27;EngineCore.step()&#x27;, file: &#x27;vllm/v1/engine/core.py&#x27;, lines: [479, 508], what: &#x27;同步基线下，只要 Scheduler 还有请求，就生成 SchedulerOutput，调用 model executor，等待模型输出，再让 Scheduler 更新状态并制作 EngineCoreOutputs。默认异步配置改由 step_with_batch_queue 跨批次重叠这些阶段。&#x27;, input: &#x27;waiting/running requests&#x27;, output: &#x27;EngineCoreOutputs&#x27; },
+        { layer: &#x27;KV / Scheduler&#x27;, title: &#x27;查 prefix hit，分配 Block IDs&#x27;, symbol: &#x27;Scheduler.schedule()&#x27;, file: &#x27;vllm/v1/core/sched/scheduler.py&#x27;, lines: [686, 915], what: &#x27;新请求先 get_computed_blocks 找最长 full-block 命中，再按 token budget 计算本轮 token 数，调用 allocate_slots。页不足就不准入；运行中请求必要时会触发 preemption。&#x27;, input: &#x27;token hashes + free block queue + token budget&#x27;, output: &#x27;block_ids + num_scheduled_tokens&#x27; },
+        { layer: &#x27;GPU ModelRunner&#x27;, title: &#x27;Block Table 变成 Slot Mapping&#x27;, symbol: &#x27;_prepare_inputs()&#x27;, file: &#x27;vllm/v1/worker/gpu_model_runner.py&#x27;, lines: [1914, 2155], what: &#x27;把 SchedulerOutput 合入 persistent batch；Block IDs 写入每请求一行的 block table，根据 position 算出本轮每个 token 的 flat slot。&#x27;, input: &#x27;SchedulerOutput&#x27;, output: &#x27;input_ids、positions、block_table、slot_mapping&#x27; },
+        { layer: &#x27;Attention Kernel&#x27;, title: &#x27;K/V scatter 写入物理页&#x27;, symbol: &#x27;do_kv_cache_update()&#x27;, file: &#x27;vllm/v1/attention/backends/flash_attn.py&#x27;, lines: [1009, 1042], what: &#x27;每一层的 K/V 通过 slot_mapping scatter 到该层预分配 KV tensor；随后 attention 使用 block table 读取离散物理页。&#x27;, input: &#x27;key、value、kv_cache、slot_mapping&#x27;, output: &#x27;更新后的 paged KV + attention output&#x27; },
+        { layer: &#x27;输出回程&#x27;, title: &#x27;token → 文本 → SSE&#x27;, symbol: &#x27;_run_output_handler()&#x27;, file: &#x27;vllm/v1/engine/async_llm.py&#x27;, lines: [637, 707], what: &#x27;后台任务从 EngineCore 拉输出，OutputProcessor detokenize、检查 stop string，放入逐请求队列；generate yield 给 OpenAI serving 层。&#x27;, input: &#x27;EngineCoreOutputs(new_token_ids)&#x27;, output: &#x27;RequestOutput → JSON/SSE chunk&#x27; }
+      ];
+
+      const flowList = root.querySelector(&#x27;#flow-list&#x27;);
+      function selectStep(index) {
+        const item = steps[index];
+        flowList.querySelectorAll(&#x27;button&#x27;).forEach((button, i) =&gt; button.setAttribute(&#x27;aria-pressed&#x27;, String(i === index)));
+        root.querySelector(&#x27;#flow-layer&#x27;).textContent = item.layer;
+        root.querySelector(&#x27;#flow-title&#x27;).textContent = `${index + 1}. ${item.title}`;
+        root.querySelector(&#x27;#flow-what&#x27;).textContent = item.what;
+        root.querySelector(&#x27;#flow-symbol&#x27;).textContent = item.symbol;
+        root.querySelector(&#x27;#flow-input&#x27;).textContent = item.input;
+        root.querySelector(&#x27;#flow-output&#x27;).textContent = item.output;
+        const link = root.querySelector(&#x27;#flow-source&#x27;);
+        link.href = src(item.file, item.lines[0], item.lines[1]);
+        link.textContent = `${item.file}:${item.lines[0]}`;
+      }
+      steps.forEach((item, index) =&gt; {
+        const button = document.createElement(&#x27;button&#x27;);
+        button.type = &#x27;button&#x27;;
+        button.className = &#x27;btn flow-step&#x27;;
+        button.setAttribute(&#x27;aria-pressed&#x27;, &#x27;false&#x27;);
+        button.innerHTML = `&lt;span class=&quot;step-no&quot;&gt;${String(index + 1).padStart(2, &#x27;0&#x27;)}&lt;/span&gt;&lt;span class=&quot;step-copy&quot;&gt;&lt;strong&gt;${item.title}&lt;/strong&gt;&lt;small&gt;${item.layer}&lt;/small&gt;&lt;/span&gt;&lt;code&gt;${item.symbol.replace(&#x27;()&#x27;, &#x27;&#x27;)}&lt;/code&gt;`;
+        button.addEventListener(&#x27;click&#x27;, () =&gt; selectStep(index));
+        flowList.appendChild(button);
+      });
+      selectStep(7);
+
+      const physicalSeed = [7, 2, 11, 5, 8, 1, 10, 4, 6, 3, 9, 12, 13, 14, 15, 16, 17];
+      const poolIds = Array.from({ length: 24 }, (_, i) =&gt; i + 1);
+      let stage = &#x27;prefill&#x27;;
+      const promptInput = root.querySelector(&#x27;#prompt-len&#x27;);
+      const blockInput = root.querySelector(&#x27;#block-size&#x27;);
+      const makeDots = (filled, size, hit) =&gt; {
+        let html = `&lt;div class=&quot;token-meter&quot; style=&quot;--cols:${size}&quot;&gt;`;
+        for (let i = 0; i &lt; size; i++) html += `&lt;i class=&quot;token-dot ${i &lt; filled ? (hit ? &#x27;hit&#x27; : &#x27;filled&#x27;) : &#x27;&#x27;}&quot;&gt;&lt;/i&gt;`;
+        return html + &#x27;&lt;/div&gt;&#x27;;
+      };
+      function renderKV() {
+        const prompt = Number(promptInput.value);
+        const bs = Number(blockInput.value);
+        root.querySelector(&#x27;#prompt-len-out&#x27;).textContent = String(prompt);
+        const previousComputed = stage === &#x27;prefill&#x27; ? prompt : prompt + 1;
+        const hitTokens = stage === &#x27;reuse&#x27; ? Math.floor(Math.max(prompt - 1, 0) / bs) * bs : 0;
+        const hitBlocks = hitTokens / bs;
+        const totalTokens = stage === &#x27;reuse&#x27; ? prompt : previousComputed;
+        const totalBlocks = Math.ceil(totalTokens / bs);
+        const oldIds = physicalSeed.slice(0, Math.ceil(previousComputed / bs));
+        const newIds = poolIds.filter(id =&gt; !oldIds.includes(id));
+        let table;
+        if (stage === &#x27;finish&#x27;) {
+          table = [];
+        } else if (stage === &#x27;reuse&#x27;) {
+          table = oldIds.slice(0, hitBlocks).concat(newIds.slice(0, totalBlocks - hitBlocks));
+        } else {
+          table = oldIds.slice(0, totalBlocks);
+        }
+        root.querySelector(&#x27;#computed-value&#x27;).textContent = `${stage === &#x27;reuse&#x27; ? prompt - hitTokens : previousComputed} tokens`;
+        root.querySelector(&#x27;#computed-context&#x27;).textContent = stage === &#x27;reuse&#x27; ? &#x27;本轮真正需要 forward 的 tokens&#x27; : (stage === &#x27;decode&#x27; ? &#x27;prompt + 已处理 T₁&#x27; : stage === &#x27;finish&#x27; ? &#x27;结束前已落入 KV 的 tokens&#x27; : &#x27;prompt prefill&#x27;);
+        root.querySelector(&#x27;#hit-value&#x27;).textContent = `${hitTokens} tokens`;
+        root.querySelector(&#x27;#hit-context&#x27;).textContent = stage === &#x27;reuse&#x27; ? `${hitBlocks} 个 full blocks；最后 token/块为 logits 重算保留` : (stage === &#x27;finish&#x27; ? &#x27;完整块现在可供后续请求命中&#x27; : &#x27;首次请求没有已有前缀&#x27;);
+        root.querySelector(&#x27;#table-value&#x27;).textContent = stage === &#x27;finish&#x27; ? &#x27;[] · request bookkeeping 已移除&#x27; : `[${table.join(&#x27;, &#x27;)}]`;
+
+        const logical = root.querySelector(&#x27;#logical-blocks&#x27;);
+        logical.innerHTML = &#x27;&#x27;;
+        if (stage === &#x27;finish&#x27;) {
+          logical.innerHTML = &#x27;&lt;p class=&quot;empty-state&quot;&gt;请求已经结束：Scheduler 删除该请求的 block table / ownership；完整页仍可留在 prefix cache 中，尾部 partial 页回到普通 free 状态。&lt;/p&gt;&#x27;;
+        } else {
+          for (let i = 0; i &lt; totalBlocks; i++) {
+            const start = i * bs;
+            const filled = Math.min(bs, totalTokens - start);
+            const isHit = stage === &#x27;reuse&#x27; &amp;&amp; i &lt; hitBlocks;
+            const div = document.createElement(&#x27;div&#x27;);
+            div.className = `kv-block ${isHit ? &#x27;shared&#x27; : &#x27;active&#x27;}`;
+            div.innerHTML = `&lt;div class=&quot;block-top&quot;&gt;&lt;strong&gt;L${i} → P${table[i]}&lt;/strong&gt;&lt;span&gt;${filled}/${bs}&lt;/span&gt;&lt;/div&gt;${makeDots(filled, bs, isHit)}&lt;span class=&quot;tokens&quot;&gt;token ${start}…${start + filled - 1}${isHit ? &#x27; · prefix hit&#x27; : filled === bs ? &#x27; · full / hashable&#x27; : &#x27; · partial&#x27;}&lt;/span&gt;`;
+            logical.appendChild(div);
+          }
+        }
+
+        const pool = root.querySelector(&#x27;#physical-pool&#x27;);
+        pool.innerHTML = &#x27;&#x27;;
+        const visibleIds = Array.from(new Set([...poolIds.slice(0, 12), ...oldIds, ...table])).sort((a, b) =&gt; a - b);
+        const oldFullCount = Math.floor(previousComputed / bs);
+        visibleIds.forEach(id =&gt; {
+          const oldIndex = oldIds.indexOf(id);
+          const currentIndex = table.indexOf(id);
+          let cls = &#x27;&#x27;;
+          let label = &#x27;free&#x27;;
+          let ref = &#x27;ref=0&#x27;;
+          if (stage === &#x27;finish&#x27; &amp;&amp; oldIndex &gt;= 0 &amp;&amp; oldIndex &lt; oldFullCount) {
+            cls = &#x27;cached&#x27;; label = &#x27;cached · LRU 候选&#x27;;
+          } else if (stage === &#x27;finish&#x27; &amp;&amp; oldIndex &gt;= 0) {
+            label = &#x27;free · partial / unhashable&#x27;;
+          } else if (stage === &#x27;reuse&#x27; &amp;&amp; currentIndex &gt;= 0 &amp;&amp; currentIndex &lt; hitBlocks) {
+            cls = &#x27;shared&#x27;; label = &#x27;prefix shared&#x27;; ref = &#x27;ref=1&#x27;;
+          } else if (stage !== &#x27;finish&#x27; &amp;&amp; currentIndex &gt;= 0) {
+            cls = &#x27;active&#x27;; label = stage === &#x27;reuse&#x27; ? &#x27;new allocation&#x27; : &#x27;active&#x27;; ref = &#x27;ref=1&#x27;;
+          } else if (stage === &#x27;reuse&#x27; &amp;&amp; oldIndex &gt;= 0 &amp;&amp; oldIndex &lt; oldFullCount) {
+            cls = &#x27;cached&#x27;; label = &#x27;cached · 未命中&#x27;;
+          } else if (stage === &#x27;reuse&#x27; &amp;&amp; oldIndex &gt;= 0) {
+            label = &#x27;free · partial / unhashable&#x27;;
+          }
+          const div = document.createElement(&#x27;div&#x27;);
+          div.className = `kv-block ${cls}`;
+          div.innerHTML = `&lt;div class=&quot;block-top&quot;&gt;&lt;strong&gt;Physical ${id}&lt;/strong&gt;&lt;span&gt;${ref}&lt;/span&gt;&lt;/div&gt;&lt;span class=&quot;tokens&quot;&gt;${label}&lt;/span&gt;`;
+          pool.appendChild(div);
+        });
+
+        if (stage === &#x27;finish&#x27;) {
+          root.querySelector(&#x27;#map-pos&#x27;).textContent = &#x27;—&#x27;;
+          root.querySelector(&#x27;#map-logical&#x27;).textContent = &#x27;—&#x27;;
+          root.querySelector(&#x27;#map-physical&#x27;).textContent = &#x27;—&#x27;;
+          root.querySelector(&#x27;#map-offset&#x27;).textContent = &#x27;—&#x27;;
+          root.querySelector(&#x27;#map-slot&#x27;).textContent = &#x27;request 已释放，无当前 slot&#x27;;
+        } else {
+          const pos = Math.max((stage === &#x27;reuse&#x27; ? prompt - 1 : previousComputed - 1), 0);
+          const logicalIndex = Math.floor(pos / bs);
+          const physical = table[logicalIndex];
+          const offset = pos % bs;
+          root.querySelector(&#x27;#map-pos&#x27;).textContent = String(pos);
+          root.querySelector(&#x27;#map-logical&#x27;).textContent = String(logicalIndex);
+          root.querySelector(&#x27;#map-physical&#x27;).textContent = String(physical);
+          root.querySelector(&#x27;#map-offset&#x27;).textContent = String(offset);
+          root.querySelector(&#x27;#map-slot&#x27;).textContent = `${physical} × ${bs} + ${offset} = ${physical * bs + offset}`;
+        }
+      }
+      promptInput.addEventListener(&#x27;input&#x27;, renderKV);
+      blockInput.addEventListener(&#x27;change&#x27;, renderKV);
+      root.querySelectorAll(&#x27;[data-stage]&#x27;).forEach(button =&gt; button.addEventListener(&#x27;click&#x27;, () =&gt; {
+        stage = button.dataset.stage;
+        root.querySelectorAll(&#x27;[data-stage]&#x27;).forEach(b =&gt; b.setAttribute(&#x27;aria-pressed&#x27;, String(b === button)));
+        renderKV();
+      }));
+      renderKV();
+
+      const calcIds = [&#x27;calc-layers&#x27;, &#x27;calc-heads&#x27;, &#x27;calc-dim&#x27;, &#x27;calc-bytes&#x27;, &#x27;calc-block&#x27;, &#x27;calc-tokens&#x27;];
+      const formatBytes = bytes =&gt; {
+        const units = [&#x27;B&#x27;, &#x27;KiB&#x27;, &#x27;MiB&#x27;, &#x27;GiB&#x27;, &#x27;TiB&#x27;];
+        let value = bytes;
+        let i = 0;
+        while (value &gt;= 1024 &amp;&amp; i &lt; units.length - 1) { value /= 1024; i++; }
+        return `${value &gt;= 100 || i === 0 ? value.toFixed(0) : value &gt;= 10 ? value.toFixed(1) : value.toFixed(2)} ${units[i]}`;
+      };
+      function renderCalc() {
+        const [layers, heads, dim, bytes, block, tokens] = calcIds.map(id =&gt; Math.max(1, Number(root.querySelector(`#${id}`).value) || 1));
+        const perToken = 2 * layers * heads * dim * bytes;
+        const pages = Math.ceil(tokens / block);
+        const waste = pages * block - tokens;
+        root.querySelector(&#x27;#per-token&#x27;).textContent = formatBytes(perToken);
+        root.querySelector(&#x27;#per-page&#x27;).textContent = formatBytes(perToken * block);
+        root.querySelector(&#x27;#page-context&#x27;).textContent = `${block} tokens / page`;
+        const payloadBytes = perToken * tokens;
+        const allocatedBytes = perToken * pages * block;
+        root.querySelector(&#x27;#sequence-size&#x27;).textContent = formatBytes(allocatedBytes);
+        root.querySelector(&#x27;#sequence-context&#x27;).textContent = `有效数据 ${formatBytes(payloadBytes)} · ${pages} pages · 尾页 ${waste} 空槽`;
+      }
+      calcIds.forEach(id =&gt; root.querySelector(`#${id}`).addEventListener(&#x27;input&#x27;, renderCalc));
+      renderCalc();
+
+      const sources = [
+        [&#x27;HTTP 路由&#x27;, &#x27;api_router.py:40&#x27;, &#x27;vllm/entrypoints/openai/chat_completion/api_router.py&#x27;, 40, 74, &#x27;POST、handler、StreamingResponse&#x27;],
+        [&#x27;Chat serving&#x27;, &#x27;serving.py:249&#x27;, &#x27;vllm/entrypoints/openai/chat_completion/serving.py&#x27;, 249, 389, &#x27;渲染输入、SamplingParams、engine_client.generate&#x27;],
+        [&#x27;AsyncLLM 请求面&#x27;, &#x27;async_llm.py:280&#x27;, &#x27;vllm/v1/engine/async_llm.py&#x27;, 280, 412, &#x27;InputProcessor、OutputProcessor、发往 Core&#x27;],
+        [&#x27;AsyncLLM 输出面&#x27;, &#x27;async_llm.py:637&#x27;, &#x27;vllm/v1/engine/async_llm.py&#x27;, 637, 707, &#x27;后台接收、detokenize、逐请求队列&#x27;],
+        [&#x27;Core ZMQ 客户端&#x27;, &#x27;core_client.py:1121&#x27;, &#x27;vllm/v1/engine/core_client.py&#x27;, 1121, 1124, &#x27;ADD 消息发送&#x27;],
+        [&#x27;Engine 同步 step&#x27;, &#x27;core.py:479&#x27;, &#x27;vllm/v1/engine/core.py&#x27;, 479, 508, &#x27;同步 schedule → execute_model → update&#x27;],
+        [&#x27;Engine batch queue&#x27;, &#x27;core.py:519&#x27;, &#x27;vllm/v1/engine/core.py&#x27;, 519, 630, &#x27;默认异步调度下跨批次重叠执行与更新&#x27;],
+        [&#x27;Core busy loop&#x27;, &#x27;core.py:1259&#x27;, &#x27;vllm/v1/engine/core.py&#x27;, 1259, 1309, &#x27;输入队列与 step 驱动&#x27;],
+        [&#x27;异步调度默认值&#x27;, &#x27;vllm.py:992&#x27;, &#x27;vllm/config/vllm.py&#x27;, 992, 1045, &#x27;兼容时默认启用 async scheduling&#x27;],
+        [&#x27;Model Runner 选择&#x27;, &#x27;vllm.py:518&#x27;, &#x27;vllm/config/vllm.py&#x27;, 518, 555, &#x27;V2 自动选择与回退条件&#x27;],
+        [&#x27;Executor 进程边界&#x27;, &#x27;parallel.py:871&#x27;, &#x27;vllm/config/parallel.py&#x27;, 871, 916, &#x27;单卡 uni；多卡默认 mp&#x27;],
+        [&#x27;KV 初始化&#x27;, &#x27;core.py:240&#x27;, &#x27;vllm/v1/engine/core.py&#x27;, 240, 322, &#x27;显存 profile、KV spec、创建 tensor&#x27;],
+        [&#x27;Scheduler&#x27;, &#x27;scheduler.py:396&#x27;, &#x27;vllm/v1/core/sched/scheduler.py&#x27;, 396, 1133, &#x27;continuous batching、prefix hit、allocate slots&#x27;],
+        [&#x27;KVCacheManager&#x27;, &#x27;kv_cache_manager.py:206&#x27;, &#x27;vllm/v1/core/kv_cache_manager.py&#x27;, 206, 474, &#x27;查命中、分配、cache、free&#x27;],
+        [&#x27;BlockPool&#x27;, &#x27;block_pool.py:144&#x27;, &#x27;vllm/v1/core/block_pool.py&#x27;, 144, 224, &#x27;页对象、free queue、hash map&#x27;],
+        [&#x27;Block 生命周期&#x27;, &#x27;block_pool.py:542&#x27;, &#x27;vllm/v1/core/block_pool.py&#x27;, 542, 635, &#x27;allocate、evict、touch、free&#x27;],
+        [&#x27;链式 block hash&#x27;, &#x27;kv_cache_utils.py:577&#x27;, &#x27;vllm/v1/core/kv_cache_utils.py&#x27;, 577, 730, &#x27;parent hash + tokens + extra keys&#x27;],
+        [&#x27;GPU Block Table&#x27;, &#x27;block_table.py:102&#x27;, &#x27;vllm/v1/worker/block_table.py&#x27;, 102, 167, &#x27;行追加、拷 GPU、slot mapping&#x27;],
+        [&#x27;Slot kernel&#x27;, &#x27;block_table.py:325&#x27;, &#x27;vllm/v1/worker/block_table.py&#x27;, 325, 380, &#x27;slot = block × size + offset&#x27;],
+        [&#x27;FlashAttention KV 写入&#x27;, &#x27;flash_attn.py:1009&#x27;, &#x27;vllm/v1/attention/backends/flash_attn.py&#x27;, 1009, 1042, &#x27;reshape_and_cache_flash scatter&#x27;],
+        [&#x27;KV page 字节公式&#x27;, &#x27;kv_cache_interface.py:163&#x27;, &#x27;vllm/v1/kv_cache_interface.py&#x27;, 163, 202, &#x27;2 × block × heads × dim × dtype&#x27;],
+        [&#x27;Prefix caching 设计&#x27;, &#x27;docs/design/prefix_caching.md&#x27;, &#x27;docs/design/prefix_caching.md&#x27;, 1, 220, &#x27;hash、full block、ref_cnt、LRU&#x27;]
+      ];
+      const sourceList = root.querySelector(&#x27;#source-list&#x27;);
+      sources.forEach(([name, label, file, start, end, note]) =&gt; {
+        const row = document.createElement(&#x27;div&#x27;);
+        row.className = &#x27;source-row&#x27;;
+        row.innerHTML = `&lt;strong&gt;${name}&lt;/strong&gt;&lt;a target=&quot;_blank&quot; rel=&quot;noreferrer&quot; href=&quot;${src(file, start, end)}&quot;&gt;&lt;code&gt;${label}&lt;/code&gt;&lt;/a&gt;&lt;span&gt;${note}&lt;/span&gt;`;
+        sourceList.appendChild(row);
+      });
+    })();
+  &lt;/script&gt;
+&lt;/div&gt;
+
+&lt;script src=&quot;https://unpkg.com/@floating-ui/core@1.7.3/dist/floating-ui.core.umd.min.js&quot;&gt;&lt;/script&gt;
+&lt;script src=&quot;https://unpkg.com/@floating-ui/dom@1.7.4/dist/floating-ui.dom.umd.min.js&quot;&gt;&lt;/script&gt;
+&lt;script&gt;
+(() =&gt; {
+  if (window.FloatingUIDOM == null) {
+    return;
+  }
+  const { autoUpdate, computePosition, flip, offset, shift, size } =
+    window.FloatingUIDOM;
+  const tooltipPlacements = new Set([&quot;top&quot;, &quot;right&quot;, &quot;bottom&quot;, &quot;left&quot;]);
+  const tooltipId = `codex-visualization-tooltip-${
+    window.crypto?.randomUUID?.() ?? Date.now().toString(36)
+  }`;
+  const tooltipGap = 5;
+  const hoverDelay = 700;
+  const skipDelay = 300;
+  let activeTrigger = null;
+  let pendingTrigger = null;
+  let tooltip = null;
+  let openTimeout = null;
+  let autoUpdateCleanup = null;
+  let positionRequest = 0;
+  let skipDelayUntil = 0;
+
+  const getTrigger = (target) =&gt;
+    target?.nodeType === Node.ELEMENT_NODE
+      ? target.closest(&quot;[data-tooltip]&quot;)
+      : null;
+  const containsTarget = (trigger, target) =&gt;
+    target?.nodeType != null &amp;&amp; trigger.contains(target);
+  const getContent = (trigger) =&gt;
+    trigger.getAttribute(&quot;data-tooltip&quot;)?.trim() ?? &quot;&quot;;
+  const getPlacement = (trigger) =&gt; {
+    const placement = trigger.getAttribute(&quot;data-tooltip-placement&quot;);
+    return tooltipPlacements.has(placement) ? placement : &quot;top&quot;;
+  };
+  const getTooltip = () =&gt; {
+    if (tooltip == null) {
+      tooltip = document.createElement(&quot;div&quot;);
+      tooltip.id = tooltipId;
+      tooltip.className = &quot;tooltip&quot;;
+      tooltip.setAttribute(&quot;role&quot;, &quot;tooltip&quot;);
+    }
+    return tooltip;
+  };
+  const setDescribedBy = (trigger, described) =&gt; {
+    const ids = new Set(
+      (trigger.getAttribute(&quot;aria-describedby&quot;) ?? &quot;&quot;)
+        .split(/\s+/)
+        .filter(Boolean),
+    );
+    if (described) {
+      ids.add(tooltipId);
+    } else {
+      ids.delete(tooltipId);
+    }
+    if (ids.size === 0) {
+      trigger.removeAttribute(&quot;aria-describedby&quot;);
+    } else {
+      trigger.setAttribute(&quot;aria-describedby&quot;, [...ids].join(&quot; &quot;));
+    }
+  };
+  const clearOpenTimeout = () =&gt; {
+    if (openTimeout != null) {
+      window.clearTimeout(openTimeout);
+      openTimeout = null;
+    }
+    pendingTrigger = null;
+  };
+  const closeTooltip = (activateSkipDelay = true) =&gt; {
+    clearOpenTimeout();
+    positionRequest += 1;
+    autoUpdateCleanup?.();
+    autoUpdateCleanup = null;
+    if (activeTrigger == null) {
+      return;
+    }
+    setDescribedBy(activeTrigger, false);
+    activeTrigger = null;
+    tooltip?.remove();
+    if (activateSkipDelay) {
+      skipDelayUntil = Date.now() + skipDelay;
+    }
+  };
+  const updatePosition = (trigger, floating) =&gt; {
+    const request = ++positionRequest;
+    void computePosition(trigger, floating, {
+      middleware: [
+        offset(tooltipGap),
+        flip({ padding: tooltipGap }),
+        shift({ padding: tooltipGap }),
+        size({
+          padding: tooltipGap,
+          apply({ availableHeight, availableWidth, elements }) {
+            elements.floating.style.setProperty(
+              &quot;--tooltip-available-width&quot;,
+              `${Math.max(0, availableWidth)}px`,
+            );
+            elements.floating.style.setProperty(
+              &quot;--tooltip-available-height&quot;,
+              `${Math.max(0, availableHeight)}px`,
+            );
+          },
+        }),
+      ],
+      placement: getPlacement(trigger),
+      strategy: &quot;fixed&quot;,
+    })
+      .then(({ x, y }) =&gt; {
+        if (activeTrigger !== trigger || request !== positionRequest) {
+          return;
+        }
+        const scale = window.devicePixelRatio || 1;
+        floating.style.transform = `translate(${Math.round(x * scale) / scale}px, ${Math.round(y * scale) / scale}px)`;
+        floating.style.visibility = &quot;visible&quot;;
+      })
+      .catch(() =&gt; {
+        if (activeTrigger === trigger &amp;&amp; request === positionRequest) {
+          closeTooltip(false);
+        }
+      });
+  };
+  const openTooltip = (trigger) =&gt; {
+    const content = getContent(trigger);
+    if (!trigger.isConnected || content.length === 0) {
+      return;
+    }
+    clearOpenTimeout();
+    if (activeTrigger === trigger) {
+      return;
+    }
+    closeTooltip();
+    const floating = getTooltip();
+    floating.textContent = content;
+    floating.style.visibility = &quot;hidden&quot;;
+    floating.style.transform = &quot;translate(0, 0)&quot;;
+    document.body.appendChild(floating);
+    activeTrigger = trigger;
+    setDescribedBy(trigger, true);
+    autoUpdateCleanup = autoUpdate(trigger, floating, () =&gt; {
+      updatePosition(trigger, floating);
+    });
+  };
+  const requestOpen = (trigger, immediate = false) =&gt; {
+    if (
+      getContent(trigger).length === 0 ||
+      activeTrigger === trigger ||
+      pendingTrigger === trigger
+    ) {
+      return;
+    }
+    clearOpenTimeout();
+    pendingTrigger = trigger;
+    const delay =
+      immediate || activeTrigger != null || Date.now() &lt; skipDelayUntil
+        ? 0
+        : hoverDelay;
+    if (delay === 0) {
+      openTooltip(trigger);
+      return;
+    }
+    openTimeout = window.setTimeout(() =&gt; {
+      openTimeout = null;
+      pendingTrigger = null;
+      openTooltip(trigger);
+    }, delay);
+  };
+  const handlePointerOpen = (event) =&gt; {
+    if (event.pointerType === &quot;touch&quot;) {
+      return;
+    }
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    requestOpen(trigger);
+  };
+  const handleLeave = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const handleFocusIn = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (trigger?.matches(&quot;:focus-visible&quot;)) {
+      requestOpen(trigger, true);
+    }
+  };
+  const handleKeyDown = (event) =&gt; {
+    if (event.key === &quot;Escape&quot;) {
+      closeTooltip();
+    }
+  };
+  const handleContextMenu = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const destroy = () =&gt; {
+    closeTooltip(false);
+    document.removeEventListener(&quot;pointerover&quot;, handlePointerOpen);
+    document.removeEventListener(&quot;pointerout&quot;, handleLeave);
+    document.removeEventListener(&quot;focusin&quot;, handleFocusIn);
+    document.removeEventListener(&quot;focusout&quot;, handleLeave);
+    document.removeEventListener(&quot;keydown&quot;, handleKeyDown);
+    document.removeEventListener(&quot;contextmenu&quot;, handleContextMenu);
+    tooltip = null;
+  };
+
+  document.addEventListener(&quot;pointerover&quot;, handlePointerOpen);
+  document.addEventListener(&quot;pointerout&quot;, handleLeave);
+  document.addEventListener(&quot;focusin&quot;, handleFocusIn);
+  document.addEventListener(&quot;focusout&quot;, handleLeave);
+  document.addEventListener(&quot;keydown&quot;, handleKeyDown);
+  document.addEventListener(&quot;contextmenu&quot;, handleContextMenu);
+  window.addEventListener(&quot;pagehide&quot;, destroy, { once: true });
+})();
+&lt;/script&gt;
+&lt;script id=&quot;codex-visualization-lucide&quot; async src=&quot;https://unpkg.com/lucide@1.17.0/dist/umd/lucide.js&quot;&gt;&lt;/script&gt;
+&lt;script&gt;
+(() =&gt; {
+  const initialize = () =&gt; {
+    globalThis.lucide?.createIcons({ attrs: { width: 16, height: 16 } });
+  };
+  if (globalThis.lucide != null) {
+    initialize();
+    return;
+  }
+  document
+    .getElementById(&quot;codex-visualization-lucide&quot;)
+    ?.addEventListener(&quot;load&quot;, initialize, { once: true });
+})();
+&lt;/script&gt;
+
+&lt;/body&gt;
+&lt;/html&gt;
+"></iframe>
+</body>
+</html>
