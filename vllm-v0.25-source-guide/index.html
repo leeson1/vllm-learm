@@ -1001,12 +1001,12 @@ html&gt;body{padding:0}&lt;/style&gt;
     &lt;h1&gt;一条请求，如何穿过 vLLM&lt;/h1&gt;
     &lt;p class=&quot;lede&quot;&gt;从 &lt;code&gt;POST /v1/chat/completions&lt;/code&gt; 追到调度、GPU forward、Paged KV 写入，再沿输出队列返回 SSE。重点把“预分配显存、Block ID、Block Table、Slot Mapping、Prefix Cache”五个容易混淆的概念拆开。&lt;/p&gt;
     &lt;nav class=&quot;quick-nav&quot; aria-label=&quot;章节导航&quot;&gt;
-      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#architecture&quot;&gt;进程架构&lt;/a&gt;
-      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#request-flow&quot;&gt;请求调用链&lt;/a&gt;
-      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#kv-basics&quot;&gt;KV 原理&lt;/a&gt;
-      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#kv-simulator&quot;&gt;分页模拟器&lt;/a&gt;
-      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#memory&quot;&gt;显存计算&lt;/a&gt;
-      &lt;a class=&quot;btn btn-ghost&quot; href=&quot;#sources&quot;&gt;源码索引&lt;/a&gt;
+      &lt;button class=&quot;btn btn-ghost&quot; type=&quot;button&quot; data-scroll-target=&quot;architecture&quot; aria-controls=&quot;architecture&quot;&gt;进程架构&lt;/button&gt;
+      &lt;button class=&quot;btn btn-ghost&quot; type=&quot;button&quot; data-scroll-target=&quot;request-flow&quot; aria-controls=&quot;request-flow&quot;&gt;请求调用链&lt;/button&gt;
+      &lt;button class=&quot;btn btn-ghost&quot; type=&quot;button&quot; data-scroll-target=&quot;kv-basics&quot; aria-controls=&quot;kv-basics&quot;&gt;KV 原理&lt;/button&gt;
+      &lt;button class=&quot;btn btn-ghost&quot; type=&quot;button&quot; data-scroll-target=&quot;kv-simulator&quot; aria-controls=&quot;kv-simulator&quot;&gt;分页模拟器&lt;/button&gt;
+      &lt;button class=&quot;btn btn-ghost&quot; type=&quot;button&quot; data-scroll-target=&quot;memory&quot; aria-controls=&quot;memory&quot;&gt;显存计算&lt;/button&gt;
+      &lt;button class=&quot;btn btn-ghost&quot; type=&quot;button&quot; data-scroll-target=&quot;sources&quot; aria-controls=&quot;sources&quot;&gt;源码索引&lt;/button&gt;
     &lt;/nav&gt;
   &lt;/header&gt;
 
@@ -1199,6 +1199,13 @@ html&gt;body{padding:0}&lt;/style&gt;
       const commit = &#x27;702f4814fe54fabff350d43cb753ae3e47c0c276&#x27;;
       const repo = `https://github.com/vllm-project/vllm/blob/${commit}/`;
       const src = (file, start, end) =&gt; `${repo}${file}#L${start}-L${end}`;
+
+      root.querySelectorAll(&#x27;[data-scroll-target]&#x27;).forEach(button =&gt; {
+        button.addEventListener(&#x27;click&#x27;, () =&gt; {
+          const target = root.querySelector(`#${button.dataset.scrollTarget}`);
+          target?.scrollIntoView({ behavior: &#x27;smooth&#x27;, block: &#x27;start&#x27; });
+        });
+      });
 
       const steps = [
         { layer: &#x27;HTTP / FastAPI&#x27;, title: &#x27;路由接住 OpenAI 请求&#x27;, symbol: &#x27;create_chat_completion()&#x27;, file: &#x27;vllm/entrypoints/openai/chat_completion/api_router.py&#x27;, lines: [40, 74], what: &#x27;校验 JSON，取得 OpenAIServingChat handler。handler 返回普通响应或异步生成器；流式场景包成 text/event-stream。&#x27;, input: &#x27;ChatCompletionRequest + Starlette Request&#x27;, output: &#x27;ChatCompletionResponse 或 StreamingResponse&#x27; },
