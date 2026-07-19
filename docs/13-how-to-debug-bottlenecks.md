@@ -1,520 +1,351 @@
-# 13｜如何定位 GPU / CPU / 网络瓶颈
+# 13｜如何定位 vLLM v0.25.0 的 GPU、CPU、KV 与网络瓶颈
 
-压测之后，下一步是定位瓶颈。
+> 版本基线：vLLM v0.25.0，源码 commit `702f4814fe54fabff350d43cb753ae3e47c0c276`。排障结论必须绑定模型、硬件、workload、Model Runner、async scheduling、attention backend 和 optimization level。
 
-很多人看到 vLLM 慢，第一反应是：
-
-```text
-是不是 GPU 不行？
-是不是参数没调好？
-是不是模型太大？
-```
-
-但线上推理服务的瓶颈可能出现在很多位置：
+## 1. 第一原则：先定位时间花在哪一层
 
 ```text
-客户端压测工具
-网络
-HTTP server
-tokenizer / detokenizer
-Scheduler
-KV Cache
-GPU kernel
-多进程通信
-流式输出
-日志和 metrics
+客户端/压测器
+  -> 网络/反向代理
+  -> API、chat template、tokenizer
+  -> Engine waiting queue
+  -> Scheduler / KV allocation
+  -> Worker input preparation
+  -> GPU model/attention/collective
+  -> sampler/detokenizer/SSE
 ```
 
-这篇建立一套排障方法。
+“GPU utilization 低”只是现象，不是根因。可能是客户端发不满、排队策略、CPU 同步、batch 太小、数据准备、通信或日志开销。
 
-## 1. 先从现象分类
-
-不要直接猜原因。
-
-先把问题归类。
-
-### 1.1 TTFT 高
-
-表现：
+可以先用这棵树缩小范围：
 
 ```text
-请求发出后，很久才收到第一个 token。
+请求慢/吞吐低
+│
+├─ 客户端实际 request rate 达标吗？
+│   ├─ 否 → 客户端 CPU、连接、SSE 消费、网络/代理
+│   └─ 是
+│
+├─ waiting / queue time 持续增长吗？
+│   ├─ 是 → 服务已饱和；再看 GPU、KV 或通信限制
+│   └─ 否
+│
+├─ 主要是 TTFT 高吗？
+│   ├─ 是 → API/tokenizer → 排队 → prefill/APC
+│   └─ 否
+│
+├─ 主要是 TPOT/ITL 高吗？
+│   ├─ 是 → decode batch → KV 读取 → backend/launch
+│   └─ 否
+│
+├─ KV usage / preemption 高吗？
+│   ├─ 是 → 长度、max_num_seqs、KV dtype、容量/准入
+│   └─ 否
+│
+└─ 上 Nsight Systems
+    ├─ GPU 有空洞 → CPU preparation / sync / client
+    ├─ kernel 连续 → compute 或 memory bound
+    └─ NCCL 占主导 → TP/PP/互联与通信
 ```
 
-可能原因：
+## 2. 先固定可复现基线
 
-1. 请求在 waiting queue 中排队。
-2. prompt 太长，prefill 重。
-3. 长 prompt 阻塞 decode。
-4. tokenizer 慢。
-5. prefix cache 没命中。
-6. GPU 已经饱和。
+保存：
 
-### 1.2 TPOT 高
+- `vllm.__version__` 和 commit；
+- 完整 server 命令及启动日志；
+- GPU/驱动/CUDA/PyTorch；
+- 模型 revision、dtype、quantization；
+- 输入/输出长度与 arrival process；
+- V1/V2 Model Runner；
+- sync/async scheduling；
+- attention backend；
+- optimization/CUDA Graph 模式。
 
-表现：
+v0.25.0 的 V2、async 和 O2 可能自动选择或回退。如果不记录最终解析结果，同一条表面命令也可能落到不同路径。
+
+## 3. 按指标症状分类
+
+### TTFT 高
+
+优先拆成：
 
 ```text
-第一个 token 出来了，但后续 token 间隔很长。
+客户端等待
++ API/tokenize
++ request_queue_time
++ prefill_time
++ 首次输出交付
 ```
 
-可能原因：
+常见原因：arrival rate 超载、长 prompt、chunked prefill/token budget 不合适、CPU tokenizer、APC 未命中、GPU 已饱和。
 
-1. decode batch 形态不好。
-2. 长上下文导致 KV Cache 读取重。
-3. attention backend 受显存带宽限制。
-4. CUDA Graph 没有有效复用。
-5. CPU launch overhead 高。
-6. streaming 输出处理慢。
+### TPOT/ITL 高
 
-### 1.3 吞吐低
+优先看：
 
-表现：
+- decode batch 形状和上下文长度；
+- KV Cache 读取与 attention backend；
+- running 请求是否被长 prefill 干扰；
+- CPU/GPU 是否有 launch/sync 空洞；
+- CUDA Graph 是否实际 replay；
+- streaming 客户端是否及时读取。
+
+### Throughput 低
+
+区分：
 
 ```text
-GPU 看起来没满，但 tokens/s 上不去。
+GPU 没被喂满
+GPU/通信已经饱和
+KV 容量限制有效 batch
+客户端实际到达率低于目标
 ```
 
-可能原因：
+### OOM 或频繁 preemption
 
-1. batch 太小。
-2. 客户端压测工具打不满。
-3. CPU 成为瓶颈。
-4. tokenizer / detokenizer 慢。
-5. 网络连接数不足。
-6. 日志或 metrics 过重。
-
-### 1.4 显存 OOM
-
-表现：
+OOM 阶段必须先分类：
 
 ```text
-请求量上来后 OOM，或者服务启动时就 OOM。
+权重加载 OOM
+compile/CUDA Graph/workspace OOM
+KV Cache 建池 OOM
+运行时临时 buffer/功能组合 OOM
 ```
 
-可能原因：
+降低 `gpu_memory_utilization` 只会减少 KV 预算，不能让放不下的权重自动变小。
 
-1. 模型权重太大。
-2. max_model_len 太大。
-3. max_num_seqs 太大。
-4. gpu_memory_utilization 太激进。
-5. KV Cache 占用过高。
-6. 量化 / dtype 配置不合理。
-
-## 2. 建立分层排查模型
-
-建议按下面顺序排查：
-
-```text
-客户端
-  -> 网络
-  -> API / HTTP server
-  -> CPU preprocessing
-  -> Scheduler / queue
-  -> KV Cache / memory
-  -> GPU execution
-  -> output streaming
-```
-
-不要一开始就用 Nsight。
-
-先用低成本指标缩小范围，再上重型 profiler。
-
-## 3. 第一步：确认压测工具没有瓶颈
-
-很多“服务端瓶颈”其实是客户端打不满。
+## 4. 第一步：证明客户端不是瓶颈
 
 检查：
 
+- benchmark 实际 request rate 是否达到目标；
+- 客户端 CPU、连接数和 event loop；
+- server 与 client 时钟/时间口径；
+- SSE 是否持续消费；
+- 反向代理是否缓冲 stream；
+- 错误/超时是否被统计为成功；
+- 同机压测是否与 server 争 CPU/网络。
+
+低成本验证：使用另一台压测机或第二个客户端实现，比较服务端 `prompt_tokens`/`generation_tokens` 增量与客户端统计。
+
+## 5. 第二步：看 queue，而不是先看 kernel
+
 ```text
-压测机 CPU 是否打满？
-压测机网络是否打满？
-连接数是否足够？
-请求是否真的并发发出？
-是否同步等待导致压测串行化？
+vllm:num_requests_running
+vllm:num_requests_waiting
+vllm:num_requests_waiting_by_reason
+vllm:request_queue_time_seconds
 ```
 
-建议：
+典型判断：
 
-1. 压测机和服务机分开。
-2. 客户端记录每个请求的时间线。
-3. 服务端也记录请求到达时间。
-4. 对比两边统计是否一致。
+| 现象 | 更可能的方向 |
+|---|---|
+| waiting 持续增长，吞吐平台 | arrival rate 超过容量 |
+| waiting 低但 TTFT 高 | prefill/API/首次输出本身慢 |
+| running 接近上限、KV 高 | seq/KV 容量约束 |
+| queue 呈 burst 后回落 | 突发流量或客户端节奏 |
 
-## 4. 第二步：看 GPU 是否忙
+如果已经超载，调 kernel 可能只改善少量峰值；先建立 backpressure、SLO goodput 和容量余量。
 
-用 `nvidia-smi` 可以先粗看：
+## 6. 第三步：看 KV Cache 和 preemption
+
+```text
+vllm:kv_cache_usage_perc
+vllm:num_preemptions
+vllm:prompt_tokens_cached
+vllm:prefix_cache_queries
+vllm:prefix_cache_hits
+```
+
+KV 高且 preemption 增长时：
+
+- 限制输入和最大输出长度；
+- 降低 `max_num_seqs`；
+- 调整外层 arrival rate/并发；
+- 增加安全的 KV 显存预算；
+- 评估权重量化、KV FP8 或并行策略；
+- 检查是否有客户端取消但 Core 未清理的异常。
+
+不要把“prefix cache 未释放”简单当作泄漏：`ref_cnt=0` 的 cached blocks 本就在 free queue 中，可被 LRU 驱逐和重新分配。真正要看的是可用 blocks、ref counts、请求 ownership 和是否持续无法回收。
+
+## 7. 第四步：区分 prefill 与 decode
+
+做两个控制 workload：
+
+```text
+长输入短输出：4096 / 32
+短输入长输出：128 / 512
+```
+
+如果前者恶化明显：
+
+- 看 input tokens/s、prefill time；
+- token budget 和 chunked prefill；
+- APC 正/负对照；
+- tokenizer/输入处理；
+- prefill attention/GEMM kernel。
+
+如果后者恶化明显：
+
+- 看 TPOT/ITL 随上下文增长的曲线；
+- decode batch size；
+- attention backend/KV dtype；
+- CUDA Graph replay 与 launch gaps；
+- speculative decoding 是否适合该 QPS。
+
+## 8. 第五步：看 CPU/GPU 时间线
+
+`nvidia-smi` 只能给粗粒度 utilization。更可靠的是 Nsight Systems：
 
 ```bash
-nvidia-smi dmon
-nvidia-smi pmon
+nsys profile \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end repeat \
+  vllm serve <model> --profiler-config.profiler cuda
 ```
 
-观察：
-
-```text
-GPU utilization
-显存占用
-功耗
-温度
-是否降频
-```
-
-几种典型情况：
-
-### 4.1 GPU 利用率低，延迟高
-
-通常说明瓶颈可能在 GPU 之前：
-
-```text
-CPU / tokenizer / 调度 / 网络 / batch 太小
-```
-
-### 4.2 GPU 利用率高，延迟也高
-
-可能是 GPU 已经饱和：
-
-```text
-模型计算重
-attention 读 KV 重
-并发过高
-上下文太长
-```
-
-### 4.3 显存接近上限
-
-说明 KV Cache 或模型权重压力大。
-
-需要看：
-
-```text
-max_model_len
-max_num_seqs
-gpu_memory_utilization
-kv_cache_dtype
-quantization
-```
-
-## 5. 第三步：看 CPU 是否成为瓶颈
-
-LLM Serving 不是纯 GPU 服务。
-
-CPU 可能负责：
-
-```text
-HTTP 请求处理
-tokenizer
-detokenizer
-Sampling 后处理
-进程间通信
-日志
-metrics
-streaming response
-```
-
-检查：
+客户端用少量请求触发：
 
 ```bash
-top
-htop
-pidstat -p <pid> 1
-mpstat -P ALL 1
-```
-
-如果 CPU 单核打满，要特别注意 Python 侧逻辑或 tokenizer。
-
-常见现象：
-
-```text
-GPU utilization 不高
-CPU 某几个核心很高
-TTFT/TPOT 都不稳定
-```
-
-这时不要继续盲目调 GPU 参数。
-
-## 6. 第四步：看请求队列
-
-如果 vLLM metrics 可用，重点看：
-
-```text
-waiting requests
-running requests
-request queue time
-preemption count
-```
-
-如果 waiting requests 持续增长：
-
-```text
-输入流量 > 服务处理能力
-```
-
-这时 TTFT 一定会变差。
-
-解决方向：
-
-1. 降低输入 QPS。
-2. 增加副本。
-3. 调整 max_num_batched_tokens / max_num_seqs。
-4. 限制 max_model_len / max_tokens。
-5. 针对长请求做限流或隔离。
-
-## 7. 第五步：看 KV Cache 状态
-
-KV Cache 是 vLLM 的核心资源。
-
-重点关注：
-
-```text
-KV block 使用率
-剩余 block 数
-抢占次数
-prefix cache 命中率
-OOM / allocation failure
-```
-
-典型问题：
-
-### 7.1 KV block 不够
-
-表现：
-
-```text
-并发上来后抢占频繁
-TTFT 和 TPOT 都变差
-显存占用高
-```
-
-解决方向：
-
-1. 降低 max_num_seqs。
-2. 降低 max_model_len。
-3. 限制 max_tokens。
-4. 使用更低精度 KV Cache。
-5. 使用更小模型或量化模型。
-
-### 7.2 prefix cache 命中率低
-
-如果开启 prefix caching 但命中率低，说明 workload 不匹配。
-
-检查：
-
-```text
-system prompt 是否真的一致？
-模板中是否包含动态字段？
-时间戳、request id 是否放在前缀中？
-用户输入是否太早出现？
-```
-
-## 8. 第六步：区分 prefill 瓶颈和 decode 瓶颈
-
-这是 LLM Serving 排障最重要的分类之一。
-
-### 8.1 prefill 瓶颈
-
-表现：
-
-```text
-TTFT 高
-长 prompt 请求影响明显
-input tokens/s 成为关键指标
-```
-
-解决方向：
-
-1. chunked prefill。
-2. prefix caching。
-3. 限制 prompt 长度。
-4. 优化 tokenizer。
-5. 调整 max_num_batched_tokens。
-
-### 8.2 decode 瓶颈
-
-表现：
-
-```text
-TPOT 高
-output tokens/s 上不去
-长输出请求拖慢整体
-```
-
-解决方向：
-
-1. 调整 max_num_seqs。
-2. 使用更适合的 attention backend。
-3. 开启 CUDA Graph。
-4. 尝试 speculative decoding。
-5. 限制 max_tokens。
-
-## 9. 第七步：使用 profiler
-
-当普通指标无法解释问题时，再上 profiler。
-
-### 9.1 Nsight Systems
-
-适合看全链路时间线：
-
-```text
-CPU 线程
-CUDA kernel launch
-GPU kernel 执行
-CPU/GPU 空洞
-同步点
+vllm bench serve ... --profile --num-prompts 2
 ```
 
 重点看：
 
-```text
-GPU 是否有长时间空闲？
-CPU 是否在 kernel launch 前卡住？
-是否存在频繁同步？
-kernel 间隔是否很大？
+- GPU 是否有规则性空洞；
+- CPU scheduling/input preparation 是否与 GPU 重叠；
+- 是否存在频繁 device synchronization；
+- NCCL/all-reduce 是否占主导；
+- graph capture/replay 与 eager launch 的差异；
+- 哪类 kernel 占 GPU 时间。
+
+只有确认热点 kernel 后，才使用 Nsight Compute 查看 memory throughput、occupancy、tensor core、shared memory 和 warp stalls。
+
+## 9. 用开关做二分诊断
+
+### 去掉 CUDA Graph/compile 干扰
+
+```bash
+vllm serve <model> --enforce-eager
 ```
 
-### 9.2 Nsight Compute
+用于判断异常是否与 graph capture、shape、compile 或 replay 有关。它通常不是性能最优配置。
 
-适合深入单个 kernel：
+### 去掉异步时间线
 
-```text
-occupancy
-memory bandwidth
-shared memory
-warp stall
-tensor core 使用
+```bash
+vllm serve <model> --no-async-scheduling
 ```
 
-这个阶段更偏 CUDA/HPC。
+用于让 schedule → execute → update 更易观察。如果同步后 bug 消失，继续检查 in-flight state/buffer 生命周期，不能直接把同步配置当最终修复。
 
-如果你还没读懂 attention backend，不建议太早深入 Nsight Compute。
+### 固定 V1 Model Runner
 
-## 10. 常见瓶颈模式
-
-### 10.1 CPU 喂不饱 GPU
-
-现象：
-
-```text
-GPU utilization 低
-CPU 单核/少数核心高
-请求延迟高
+```bash
+VLLM_USE_V2_MODEL_RUNNER=0 vllm serve <model>
 ```
 
-排查：
+用于区分 V1/V2 实现差异。先确认模型/功能支持，不要在生产中随意切换后只比较一条请求。
 
-```text
-tokenizer 是否慢？
-日志是否太多？
-metrics 是否过重？
-Python 侧是否有串行逻辑？
+### 显式 backend
+
+```bash
+vllm serve <model> --attention-backend <supported-backend>
 ```
 
-### 10.2 GPU 算力饱和
+只在已核对 v0.25.0 feature table 和启动日志后使用。backend 切换常同时改变 CUDA Graph/融合能力，要把这些联动记录下来。
 
-现象：
+## 10. 四种典型模式
 
-```text
-GPU utilization 高
-功耗高
-吞吐到平台期
-```
-
-排查：
+### CPU 喂不饱 GPU
 
 ```text
-模型是否太大？
-batch 是否已经合理？
-是否需要更多 GPU / 更小模型 / 量化？
+GPU 有空洞
+CPU 单核或少数线程很忙
+小 batch、短请求更明显
+关闭重日志后改善
 ```
 
-### 10.3 显存限制并发
+检查 tokenizer、detokenizer、Python callbacks、metrics/logging、async overlap、NUMA 和压测客户端。
 
-现象：
+### GPU compute 饱和
 
 ```text
-显存高
-KV block 不够
-抢占增加
-OOM
+GPU 时间线连续
+GEMM/attention kernel 占主导
+吞吐随并发进入平台
+queue 随 arrival rate 增长
 ```
 
-排查：
+检查模型/dtype/quantization、TP/PP/DP、batch shape；此时继续加并发只会增加尾延迟。
+
+### Decode memory/KV-bound
 
 ```text
-max_model_len 是否过大？
-max_num_seqs 是否过大？
-max_tokens 是否无限制？
-KV dtype 是否可降低？
+长输出或长上下文 TPOT 上升
+attention/KV kernels 比例增加
+算力指标未满但显存带宽压力大
 ```
 
-### 10.4 网络或 streaming 成为瓶颈
+检查 GQA/MLA 模型结构、KV dtype、backend、上下文长度和 speculative decoding。
 
-现象：
+### 通信瓶颈
 
 ```text
-服务端生成快，但客户端接收慢
-大量长连接
-HTTP streaming 占用 CPU
+TP 增加后 latency 恶化
+NCCL/all-reduce 占比高
+跨卡互联利用率高
+单卡能跑时反而更快
 ```
 
-排查：
+检查拓扑、NVLink/PCIe、TP 粒度、PP/DP 替代方案和 batch 大小。
+
+## 11. 排障记录模板
 
 ```text
-客户端读取是否及时？
-反向代理是否缓冲？
-网络带宽是否足够？
-连接数是否过高？
+症状：
+复现命令与 workload：
+预期/实际：
+客户端证据：
+queue/KV 指标：
+CPU/GPU 时间线：
+当前 runner/scheduler/backend/graph：
+单变量实验：
+被证伪假设：
+当前最小根因：
+修复或容量建议：
+回归验证：
 ```
 
-## 11. 一个推荐排障 checklist
+## 12. 源码核对入口
 
-```text
-1. 确认压测工具没瓶颈
-2. 看 TTFT、TPOT、吞吐、P99
-3. 看 GPU utilization 和显存
-4. 看 CPU utilization 和单核热点
-5. 看 waiting/running queue
-6. 看 KV Cache 使用率和抢占
-7. 区分 prefill 还是 decode 瓶颈
-8. 一次只改一个参数验证
-9. 必要时用 Nsight Systems
-10. 最后才深入单个 CUDA kernel
-```
+- `vllm/v1/metrics/loggers.py`：queue、KV、latency、token 指标。
+- `vllm/v1/core/sched/scheduler.py`：waiting、running、preemption。
+- `vllm/v1/core/kv_cache_manager.py`：slots 和可用 block 判断。
+- `vllm/v1/engine/core.py`：同步/异步 batch queue。
+- `vllm/v1/worker/gpu_worker.py`：Worker 执行与 profiling。
+- `vllm/v1/worker/gpu_model_runner.py`：V1 Runner。
+- `vllm/v1/worker/gpu/model_runner.py`：V2 Runner。
+- `vllm/v1/cudagraph_dispatcher.py`：CUDA Graph dispatch。
+- `vllm/benchmarks/serve.py`：客户端计时与 arrival process。
 
-## 12. 面试中怎么表达这类能力？
+## 13. 验收标准
 
-不要说：
+给定一组 TTFT/TPOT/queue/KV/GPU 曲线，应能：
 
-```text
-我会调 vLLM 参数。
-```
-
-更好的表达是：
-
-```text
-我会根据 TTFT、TPOT、tokens/s、GPU 利用率、KV Cache 使用率和队列长度判断瓶颈位于 prefill、decode、CPU 服务层还是显存资源层，并通过控制变量压测验证参数调整是否有效。
-```
-
-这更像工程能力。
-
-## 13. 本文小结
-
-定位 vLLM 瓶颈的核心是分层和分类。
-
-你需要记住：
-
-1. TTFT 高通常先看排队和 prefill。
-2. TPOT 高通常先看 decode、KV 读取和 attention backend。
-3. GPU 不满不代表 GPU 慢，可能是 CPU 或客户端喂不饱。
-4. 显存问题通常和 KV Cache、max_model_len、max_num_seqs 强相关。
-5. profiler 是最后验证工具，不是第一步。
-
-形成这套排障思路后，你就不只是“会用 vLLM”，而是开始具备 LLM Serving 工程能力。
+1. 提出最多三个有层次的假设；
+2. 用最低成本的单变量实验逐个证伪；
+3. 在需要时采一段最小 profiler trace；
+4. 把根因定位到客户端、排队、KV、CPU preparation、GPU kernel 或通信层；
+5. 用原始数据验证修复没有牺牲另一个关键 SLO。
 
 ## 参考资料
 
-- vLLM Metrics 文档：https://docs.vllm.ai/en/latest/usage/metrics.html
-- vLLM Benchmark 文档：https://docs.vllm.ai/en/latest/contributing/benchmarks.html
-- vLLM Engine Arguments：https://docs.vllm.ai/en/latest/configuration/engine_args.html
-- NVIDIA Nsight Systems：https://developer.nvidia.com/nsight-systems
-- NVIDIA Nsight Compute：https://developer.nvidia.com/nsight-compute
+- [vLLM v0.25.0 Production Metrics](https://docs.vllm.ai/en/v0.25.0/usage/metrics/)
+- [vLLM v0.25.0 Optimization and Tuning](https://docs.vllm.ai/en/v0.25.0/configuration/optimization/)
+- [vLLM v0.25.0 Profiling](https://docs.vllm.ai/en/v0.25.0/contributing/profiling/)
+- [vLLM v0.25.0 CUDA Graphs](https://docs.vllm.ai/en/v0.25.0/design/cuda_graphs/)

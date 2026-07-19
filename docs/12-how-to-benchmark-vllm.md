@@ -1,522 +1,285 @@
-# 12｜如何压测 vLLM：不要只看 tokens/s
+# 12｜如何压测 vLLM v0.25.0：从吞吐到 goodput
 
-学习 vLLM 到第三阶段，必须开始做压测。
+> 版本基线：vLLM v0.25.0 的 `vllm bench serve`，源码 commit `702f4814fe54fabff350d43cb753ae3e47c0c276`。压测客户端必须与被测 server 使用同一版本或显式记录差异。
 
-因为很多推理优化不能靠感觉判断：
+## 1. 压测首先是一份问题定义
 
-```text
-max_num_batched_tokens 调大到底有没有收益？
-prefix caching 是否真的命中？
-量化后是更快还是只省显存？
-TP=2 在没有 NVLink 的机器上是否划算？
-```
-
-这些都必须靠压测回答。
-
-## 1. 压测前先明确问题
-
-不要一上来就跑 benchmark。
-
-先明确你想回答什么问题：
+开始前必须写清楚：
 
 ```text
-问题 1：这台机器最多能支撑多少并发？
-问题 2：P99 TTFT 是否满足业务要求？
-问题 3：长 prompt 场景是否会拖慢流式输出？
-问题 4：开启 prefix caching 是否有收益？
-问题 5：量化后吞吐和质量如何变化？
-问题 6：多卡 tensor parallel 是否比单卡更快？
+目标：峰值吞吐、在线延迟、容量、回归，还是功能对比？
+模型：checkpoint/revision、dtype、quantization、max_model_len
+硬件：GPU/CPU/内存/驱动/CUDA/互联
+Server：完整命令和最终解析日志
+Workload：输入/输出长度分布、arrival rate、burstiness、并发上限
+采样：temperature、ignore_eos、seed 等
+SLO：TTFT/TPOT/E2E 的目标和统计口径
 ```
 
-不同问题需要不同压测方法。
+没有 workload 和 SLO，单独的 tokens/s 没有可迁移结论。
 
-## 2. 先理解几个指标
-
-### 2.1 TTFT
-
-TTFT：Time To First Token。
+一轮可信的性能实验是闭环，不是一次命令：
 
 ```text
-客户端发出请求 -> 收到第一个 token
+┌──────────────┐    requests     ┌──────────────┐
+│ Workload 生成 │ ──────────────> │ vLLM Server  │
+└──────┬───────┘                  └──────┬───────┘
+       │ 客户端计时                         │ /metrics / GPU trace
+       └────────────────┬──────────────────┘
+                        ▼
+                 原始 JSON + 指标快照
+                        │
+                        ▼
+                 曲线 / 容量拐点 / 异常
+                        │
+                        ▼
+                     瓶颈假设
+                        │
+                        ▼
+                 只修改一个变量
+                        │
+                        └──────────> 回到 Workload
 ```
 
-它主要受：
+## 2. v0.25.0 的核心指标
 
-1. 排队时间。
-2. tokenizer。
-3. prefill。
-4. 调度策略。
-5. prefix cache 命中率。
+### TTFT
 
-影响。
+请求开始到第一个输出 token。包含客户端/网络、API 输入处理、排队、prefill 和第一次输出交付。
 
-### 2.2 TPOT
+### TPOT
 
-TPOT：Time Per Output Token。
+通常按首 token 之后的生成耗时除以后续输出 token 数。它是请求级平均，不等于每个 token 间隔。
+
+### ITL
+
+相邻流式 token 到达间隔。P99 ITL 能暴露单个请求在 continuous batching、长 prefill 干扰或服务侧同步下的卡顿。
+
+### E2E latency
+
+从请求开始到完成。受输入、输出、排队和所有服务层开销共同影响。
+
+### Throughput
+
+至少分开记录：
+
+- request throughput；
+- input token throughput；
+- output token throughput；
+- total token throughput。
+
+### Goodput
+
+满足指定 TTFT/TPOT/E2E SLO 的完成请求数/秒。v0.25.0 `vllm bench serve --goodput` 可以按 SLO 计算，比“峰值吞吐但 P99 已不可用”更接近线上能力。
+
+## 3. 两种流量模型
+
+### 3.1 Open-loop arrival rate
+
+`--request-rate` 控制请求到达率。有限值默认使用指数到达间隔，即 Poisson 流量；`--burstiness` 改变 Gamma 分布形状：
 
 ```text
-生成阶段每个 token 的平均间隔
+burstiness < 1：更突发
+burstiness = 1：Poisson
+burstiness > 1：更均匀
 ```
 
-它主要受 decode 阶段影响。
+当 server 跟不上时，waiting queue 会增长，能真实暴露排队和 tail latency。
 
-长上下文、高并发、KV Cache 读取、attention backend 都会影响 TPOT。
+### 3.2 最大吞吐/并发限制
 
-### 2.3 E2E Latency
+`--request-rate inf` 会尽快发请求，可配合 `--max-concurrency` 测固定并发或最大吞吐。它不等于真实线上 arrival process。
 
-端到端延迟：
+报告必须说明使用哪一种，不能把固定并发和固定 QPS 的结果直接比较。
+
+## 4. 四类基础 workload
+
+| 类型 | 示例长度 | 首要指标 | 容易暴露 |
+|---|---:|---|---|
+| 短输入短输出 | 128 / 32 | E2E、req/s | API、scheduler、launch overhead |
+| 长输入短输出 | 4096 / 32 | TTFT、input tok/s | prefill、chunking、APC |
+| 短输入长输出 | 128 / 512 | TPOT/ITL、output tok/s | decode、KV 读取 |
+| 长输入长输出 | 4096 / 512 | 全部尾延迟、容量 | KV、preemption、排队 |
+
+随机定长适合控制变量，但不能代表真实流量。完成基础矩阵后，再加入真实长度分布、共享前缀和 burst trace。
+
+## 5. 可复现的基线命令
+
+启动服务：
+
+```bash
+vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --generation-config vllm
+```
+
+压测：
+
+```bash
+vllm bench serve \
+  --backend openai \
+  --base-url http://127.0.0.1:8000 \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --dataset-name random \
+  --random-input-len 512 \
+  --random-output-len 128 \
+  --ignore-eos \
+  --request-rate 4 \
+  --num-prompts 1000 \
+  --percentile-metrics ttft,tpot,itl,e2el \
+  --metric-percentiles 50,90,95,99 \
+  --save-result \
+  --save-detailed \
+  --result-dir benchmark-results
+```
+
+`--ignore-eos` 用于固定输出长度实验，可能产生不自然文本；质量评测或真实业务回放不应机械开启。
+
+先用几十请求确认流程，再用足够样本正式统计。100 个请求的 P99 实际只由极少数样本决定，不能当稳定容量结论。
+
+## 6. 找到容量拐点
+
+固定 workload，逐级增加 arrival rate：
 
 ```text
-客户端发请求 -> 完整响应结束
+1 -> 2 -> 4 -> 8 -> 16 -> 32 req/s
 ```
 
-它受输入长度、输出长度、排队、prefill、decode、网络、detokenize 全部影响。
+每档观察：
 
-### 2.4 Throughput
+- throughput 是否继续近似线性增长；
+- TTFT/queue time 是否开始陡升；
+- TPOT/ITL 是否恶化；
+- waiting 是否持续累积；
+- KV usage 和 preemption；
+- 错误率和客户端实际发出速率。
 
-吞吐不要只看 requests/s。
+典型饱和信号：吞吐趋于平台，而排队和 P99 快速上升。生产容量通常要低于这个拐点并留出 burst/故障余量。
 
-LLM Serving 更常用：
+## 7. 参数实验一次只改一个变量
+
+推荐矩阵：
 
 ```text
-input tokens/s
-output tokens/s
-total tokens/s
+max_num_batched_tokens: 2048 / 8192 / 16384
+max_num_seqs:           64 / 128 / 256
+prefix caching:         on / off（只用 shared-prefix workload）
+KV dtype:               auto / fp8（同时做质量验证）
+runner/scheduling:       教学 V1 sync / 默认路径
 ```
 
-因为两个请求的 token 数可能差十倍。
+每个 server run 保存：
 
-### 2.5 Tail Latency
+- 完整启动命令；
+- vLLM commit/version；
+- 启动日志与最终配置；
+- 原始 benchmark JSON；
+- `/metrics` 快照；
+- GPU/CPU 监控；
+- workload seed 和数据摘要。
 
-线上尤其要看：
+否则“配置 A 比 B 快”无法复现。
+
+## 8. 专门测试 Prefix Caching
+
+v0.25.0 提供 synthetic prefix repetition dataset：
+
+```bash
+vllm bench serve \
+  --backend openai \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --dataset-name prefix_repetition \
+  --num-prompts 1000 \
+  --prefix-repetition-prefix-len 2048 \
+  --prefix-repetition-suffix-len 128 \
+  --prefix-repetition-num-prefixes 5 \
+  --prefix-repetition-output-len 32 \
+  --request-rate 4 \
+  --save-result
+```
+
+APC on/off 各跑一轮，并增加一个长度相同的 random dataset 作为负对照。记录 `prompt_tokens_cached`、prefix queries/hits、TTFT 和 input throughput。
+
+## 9. 服务端观测面
+
+`/metrics` 至少采集：
 
 ```text
-P50 / P90 / P95 / P99 TTFT
-P50 / P90 / P95 / P99 TPOT
-P50 / P90 / P95 / P99 E2E latency
+vllm:num_requests_running
+vllm:num_requests_waiting
+vllm:num_requests_waiting_by_reason
+vllm:kv_cache_usage_perc
+vllm:num_preemptions
+vllm:iteration_tokens_total
+
+vllm:time_to_first_token_seconds
+vllm:inter_token_latency_seconds
+vllm:request_time_per_output_token_seconds
+vllm:e2e_request_latency_seconds
+vllm:request_queue_time_seconds
+vllm:request_prefill_time_seconds
+vllm:request_decode_time_seconds
+
+vllm:prefix_cache_queries
+vllm:prefix_cache_hits
+vllm:prompt_tokens_cached
 ```
 
-平均值好看，不代表线上体验好。
+Prometheus Counter 导出时可能带 `_total` 后缀；应以 `/metrics` 实际暴露名称和 HELP/TYPE 为准。Histogram 的 P95/P99 要从 buckets 计算，不存在一个通用的直接 `p99` 字段。
 
-## 3. 压测 workload 怎么设计？
+## 10. Profiler 与 benchmark 要分开
 
-压测必须贴近业务。
+PyTorch Profiler、逐 token 日志和详细 shape/stack 收集都会改变性能。先用普通指标定位，再用少量请求做 profiler 验证；不要把 profiling run 的延迟当基线。
 
-不要只用一个固定 prompt。
+v0.25.0 可用：
 
-### 3.1 短输入短输出
+```bash
+vllm serve <model> \
+  --profiler-config '{"profiler":"torch","torch_profiler_dir":"./profile"}'
 
-适合测试基础 overhead：
+vllm bench serve ... --profile --num-prompts 2
+```
+
+GPU 时间线优先使用 Nsight Systems；只有确认某个 kernel 是热点后，再用 Nsight Compute 深挖。
+
+## 11. 压测报告模板
 
 ```text
-input: 50 tokens
-output: 50 tokens
+1. 问题与 SLO
+2. 硬件、软件和完整命令
+3. Workload/arrival process/样本数
+4. 控制变量和实验矩阵
+5. TTFT/TPOT/ITL/E2E/throughput/goodput
+6. queue/KV/preemption/GPU/CPU 证据
+7. 拐点和异常请求分析
+8. 因果解释与尚未验证的假设
+9. 推荐配置及安全余量
+10. 原始结果路径和复现命令
 ```
 
-观察：
-
-```text
-HTTP / tokenizer / scheduler overhead
-```
-
-### 3.2 长输入短输出
-
-适合测试 prefill：
-
-```text
-input: 4000 tokens
-output: 100 tokens
-```
-
-观察：
-
-```text
-TTFT
-chunked prefill
-prefix caching
-KV block 分配
-```
-
-### 3.3 短输入长输出
-
-适合测试 decode：
-
-```text
-input: 100 tokens
-output: 2000 tokens
-```
-
-观察：
-
-```text
-TPOT
-output tokens/s
-streaming 稳定性
-```
-
-### 3.4 长输入长输出
-
-适合测试极限压力：
-
-```text
-input: 8000 tokens
-output: 2000 tokens
-```
-
-观察：
-
-```text
-显存占用
-抢占
-OOM 风险
-尾延迟
-```
-
-### 3.5 共享前缀 workload
-
-用于测试 prefix caching：
-
-```text
-固定 system prompt + 固定工具说明 + 不同用户问题
-```
-
-观察：
-
-```text
-cache hit rate
-TTFT 变化
-prefill tokens/s 变化
-```
-
-## 4. 并发模式怎么选？
-
-### 4.1 固定并发
-
-例如：
-
-```text
-并发 1、2、4、8、16、32、64、128
-```
-
-观察系统从低负载到饱和的曲线。
-
-### 4.2 固定 QPS
-
-例如：
-
-```text
-每秒 1、2、5、10、20 个请求
-```
-
-更接近线上流量。
-
-重点看排队是否开始积压。
-
-### 4.3 burst 流量
-
-例如短时间打入大量请求：
-
-```text
-10 秒内突然进入 500 个请求
-```
-
-观察：
-
-```text
-waiting queue
-TTFT P99
-抢占
-服务是否稳定
-```
-
-## 5. 推荐压测步骤
-
-### 5.1 单请求基线
-
-先跑单请求，确认服务正常。
-
-记录：
-
-```text
-TTFT
-TPOT
-E2E
-显存占用
-GPU utilization
-```
-
-### 5.2 并发阶梯压测
-
-逐步增加并发：
-
-```text
-1 -> 2 -> 4 -> 8 -> 16 -> 32 -> 64
-```
-
-每档固定跑一段时间。
-
-观察：
-
-```text
-吞吐是否继续上升
-TTFT 是否开始陡增
-TPOT 是否明显变差
-显存是否接近上限
-```
-
-### 5.3 找到饱和点
-
-饱和点通常表现为：
-
-```text
-吞吐不再明显上升
-但延迟快速恶化
-```
-
-这个点非常关键。
-
-线上通常不会把系统压到饱和点，而是留出安全余量。
-
-### 5.4 参数对比实验
-
-一次只改一个参数。
-
-例如：
-
-```text
-max_num_batched_tokens = 4096 / 8192 / 16384
-```
-
-不要同时改多个参数，否则无法判断原因。
-
-## 6. vLLM 常见压测维度
-
-### 6.1 `--max-num-batched-tokens`
-
-关注：
-
-```text
-prefill 吞吐
-TTFT
-单轮调度耗时
-```
-
-长 prompt 场景尤其重要。
-
-### 6.2 `--max-num-seqs`
-
-关注：
-
-```text
-并发能力
-KV Cache 占用
-TPOT
-抢占频率
-```
-
-### 6.3 `--gpu-memory-utilization`
-
-关注：
-
-```text
-可用 KV block 数量
-OOM 风险
-最大并发
-```
-
-不要盲目拉满。线上要给临时 buffer、驱动、监控等留余量。
-
-### 6.4 `--enable-prefix-caching`
-
-关注：
-
-```text
-cache hit rate
-TTFT
-prefill tokens/s
-显存占用变化
-```
-
-没有共享前缀的 workload 下，它的收益会很小。
-
-### 6.5 `--tensor-parallel-size`
-
-关注：
-
-```text
-单卡是否放得下模型
-多卡通信开销
-吞吐是否提升
-延迟是否恶化
-```
-
-没有 NVLink 时，TP 通信可能成为瓶颈，必须实际压测。
-
-## 7. 监控应该看什么？
-
-### 7.1 GPU
-
-用 `nvidia-smi` 只能看粗略情况。
-
-至少关注：
-
-```text
-GPU utilization
-显存占用
-功耗
-温度
-显存带宽相关指标
-```
-
-更深入可以用 Nsight Systems / Nsight Compute。
-
-### 7.2 CPU
-
-不要忽略 CPU。
-
-关注：
-
-```text
-CPU utilization
-tokenizer/detokenizer 开销
-HTTP server 开销
-进程间通信
-日志/metrics 开销
-```
-
-如果 GPU 利用率低但延迟高，可能是 CPU 侧瓶颈。
-
-### 7.3 服务指标
-
-建议至少记录：
-
-```text
-request count
-running requests
-waiting requests
-input tokens/s
-output tokens/s
-TTFT histogram
-TPOT histogram
-E2E latency histogram
-preemption count
-cache hit rate
-OOM / error count
-```
-
-## 8. 压测结果怎么分析？
-
-### 8.1 GPU 不满，延迟高
-
-可能原因：
-
-1. CPU tokenizer 慢。
-2. 请求构造/调度 overhead 高。
-3. batch 太小。
-4. 网络或客户端压测工具瓶颈。
-5. 日志太多。
-
-### 8.2 GPU 满，吞吐上不去
-
-可能原因：
-
-1. 模型计算已饱和。
-2. attention 受显存带宽限制。
-3. batch shape 不适合。
-4. KV Cache 读取成本高。
-
-### 8.3 TTFT 高
-
-可能原因：
-
-1. waiting queue 积压。
-2. prefill 太重。
-3. 长 prompt 阻塞。
-4. chunked prefill 参数不合适。
-5. prefix cache 未命中。
-
-### 8.4 TPOT 高
-
-可能原因：
-
-1. decode batch 太小或太大。
-2. 长上下文导致 KV 读取重。
-3. attention backend 性能不足。
-4. CPU launch overhead 或 CUDA Graph 未有效复用。
-
-### 8.5 显存很快打满
-
-可能原因：
-
-1. max_model_len 太大。
-2. max_num_seqs 太大。
-3. 输出太长。
-4. KV Cache dtype 太大。
-5. prefix cache 占用未释放。
-
-## 9. 压测报告应该怎么写？
-
-一份有价值的压测报告应该包含：
-
-```text
-1. 硬件环境：GPU、CPU、内存、驱动、CUDA、网络
-2. 软件版本：vLLM 版本、PyTorch、模型、dtype、量化方式
-3. 启动参数：完整 vllm serve 命令
-4. workload：输入/输出长度分布、并发/QPS、请求数
-5. 指标：TTFT、TPOT、吞吐、显存、GPU/CPU 利用率
-6. 结果曲线：并发增加时吞吐和延迟如何变化
-7. 结论：瓶颈在哪里，建议参数是什么
-```
-
-不要只贴一张 tokens/s 截图。
-
-## 10. 最小实践任务
-
-建议做一个小项目：
-
-```text
-目标：对同一个模型做 4 组压测。
-
-组 1：短输入短输出
-组 2：长输入短输出
-组 3：短输入长输出
-组 4：共享前缀请求
-```
-
-每组记录：
-
-```text
-TTFT P50/P95/P99
-TPOT P50/P95/P99
-output tokens/s
-GPU 显存
-GPU utilization
-```
-
-然后写一篇分析文章。
-
-这比单纯说“我会 vLLM 调参”更有含金量。
-
-## 11. 本文小结
-
-压测 vLLM 的核心不是跑出一个漂亮数字，而是建立因果关系：
-
-```text
-参数变化 -> 调度变化 -> KV Cache 变化 -> GPU/CPU 变化 -> TTFT/TPOT/吞吐变化
-```
-
-你需要重点记住：
-
-1. 不同 workload 会得到完全不同的结论。
-2. TTFT、TPOT、吞吐、尾延迟要一起看。
-3. 一次只改一个参数。
-4. 找到饱和点比追求峰值更重要。
-5. 线上配置要留安全余量。
+## 12. 验收标准
+
+完成以下产物：
+
+1. 四类基础 workload 的原始 JSON；
+2. arrival rate 增长时吞吐与 P99 曲线；
+3. 至少一个单变量参数实验；
+4. 一个 shared-prefix 正/负对照；
+5. 一次“客户端瓶颈不是 server 瓶颈”的排除证据；
+6. 一页明确区分事实、推断和下一步验证的结论。
+
+## 13. 源码核对入口
+
+- `vllm/benchmarks/serve.py`：CLI、arrival process、指标和结果 JSON。
+- `vllm/benchmarks/datasets/`：random、prefix repetition、ShareGPT 等 workload。
+- `vllm/benchmarks/lib/endpoint_request_func.py`：不同 endpoint 的请求计时。
+- `vllm/v1/metrics/loggers.py`：v0.25.0 指标定义。
+- `vllm/v1/metrics/prometheus.py`：Prometheus 导出。
 
 ## 参考资料
 
-- vLLM Benchmark 文档：https://docs.vllm.ai/en/latest/contributing/benchmarks.html
-- vLLM Metrics 文档：https://docs.vllm.ai/en/latest/usage/metrics.html
-- vLLM Engine Arguments：https://docs.vllm.ai/en/latest/configuration/engine_args.html
-- NVIDIA Nsight Systems：https://developer.nvidia.com/nsight-systems
-- NVIDIA Nsight Compute：https://developer.nvidia.com/nsight-compute
+- [vLLM v0.25.0 Benchmark CLI](https://docs.vllm.ai/en/v0.25.0/benchmarking/cli/)
+- [vLLM v0.25.0 Benchmarking Overview](https://docs.vllm.ai/en/v0.25.0/benchmarking/)
+- [vLLM v0.25.0 Production Metrics](https://docs.vllm.ai/en/v0.25.0/usage/metrics/)
+- [vLLM v0.25.0 Profiling](https://docs.vllm.ai/en/v0.25.0/contributing/profiling/)

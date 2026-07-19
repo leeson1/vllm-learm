@@ -1,495 +1,283 @@
-# 10｜Prefix Caching、Speculative Decoding 与 Quantization
+# 10｜v0.25.0 的 Prefix Caching、Speculative Decoding 与 Quantization
 
-第二阶段最后一篇，先把 vLLM 里几个常见高级能力串起来：
+> 版本基线：vLLM v0.25.0，源码 commit `702f4814fe54fabff350d43cb753ae3e47c0c276`。三类功能插入的层次、适用 workload 和验收指标不同；本文提供版本准确的入口，不把它们合并成一条“开启即加速”的建议。
+
+## 1. 先把三者放回主链路
 
 ```text
-Prefix Caching
+Automatic Prefix Caching
+  -> KVCacheManager / BlockPool
+  -> 跳过重复前缀的 prefill
+
 Speculative Decoding
+  -> Scheduler / proposer / target verification / sampler
+  -> 一次 target pass 尝试接受多个 token
+
 Quantization
+  -> 权重加载、linear/MoE/attention kernels、KV Cache dtype
+  -> 减少容量或带宽成本，可能改变精度和 kernel 路径
 ```
 
-它们解决的问题不同，但目标都很一致：
+因此它们分别优先影响：
+
+| 功能 | 最可能改善 | 首先验证 |
+|---|---|---|
+| Prefix caching | 重复长前缀的 TTFT、input throughput | cached tokens、命中率、TTFT |
+| Spec decode | 中低 QPS、memory-bound decode 的 ITL | acceptance、TPOT、额外显存 |
+| 权重量化 | 权重容量、部分 kernel 带宽 | 能否放下、吞吐、质量 |
+| KV 量化 | KV 容量、长上下文 decode 带宽 | 可容纳 tokens、TPOT、质量 |
+
+它们插入主链路的位置不同：
 
 ```text
-在尽量不牺牲效果的前提下，降低重复计算、提升吞吐、降低显存占用或降低延迟。
+HTTP/API
+   │
+   ▼
+Scheduler ───────── speculative token 调度/验证 ─────────┐
+   │                                                     │
+   ▼                                                     │
+KVCacheManager <──── APC hash / prefix hit               │
+   │                                                     │
+   ▼                                                     │
+Model Runner ── quantized weights / proposer ────────────┤
+   │                                                     │
+   ▼                                                     │
+Attention Backend ── quantized KV read/write             │
+   │                                                     │
+   ▼                                                     │
+Sampler <──────────── accept / reject speculative tokens ┘
+   │
+   ▼
+Output
 ```
 
-## 1. 先建立总览
+## 2. Automatic Prefix Caching 的 v0.25.0 行为
 
-可以先用一句话区分：
+Engine 参数未显式指定时，v0.25.0 根据模型是否支持 prefix caching 解析默认值；常见受支持的生成模型会默认开启。最终配置应以启动日志为准。
+
+显式控制：
+
+```bash
+vllm serve <model> --enable-prefix-caching
+vllm serve <model> --no-enable-prefix-caching
+```
+
+APC 使用 full-block 链式 hash：
 
 ```text
-Prefix Caching：复用已经算过的前缀 KV，减少重复 prefill。
-
-Speculative Decoding：用更便宜的方式先猜多个 token，再让大模型验证，减少大模型 decode 次数。
-
-Quantization：用更低精度表示权重或 KV Cache，降低显存和带宽压力。
+parent hash + block token IDs + extra keys
 ```
 
-它们分别对应三类优化：
+v0.25.0 默认 `--prefix-caching-hash-algo sha256`。还支持 CBOR/xxhash 变体；非密码学 hash 需要在性能与碰撞/隔离风险之间做明确选择，不能只因为“更快”就在多租户服务中替换。
+
+只有 prefix 相同才命中：
 
 ```text
-少算：Prefix Caching
-快算：Speculative Decoding
-省资源：Quantization
+相同 system prompt + 相同长文档 + 不同尾部问题  -> 可复用
+文本相同但出现在 prompt 中间                    -> 不可作为同一前缀命中
 ```
 
-## 2. Prefix Caching 解决什么问题？
+命中只能减少 prefill 计算，不会缩短长输出本身的 decode 循环。
 
-很多线上请求有相同前缀。
+## 3. APC 的容量和安全边界
 
-例如：
+请求结束后，完整 cached blocks 可以在 `ref_cnt=0` 时留在 free queue，直到复用或被 LRU 驱逐。因此 APC 并不是另开一块永不释放的显存；它复用同一个 KV block pool。
+
+多租户环境可在请求中提供 `cache_salt`。salt 会进入首 block 的 hash，只有相同 salt 的请求才能共享该前缀，可用于划分信任域并降低基于命中时间的侧信道风险。
+
+APC 实验至少要分两种 workload：
 
 ```text
-system prompt: 你是一个专业的代码助手...
-工具说明: 你可以调用以下工具...
-few-shot examples: 示例 1、示例 2、示例 3...
-用户问题: xxx
+shared-prefix：固定 4K/8K 前缀，只改末尾问题
+unique-prefix：长度相同，但每个 prompt 内容不同
 ```
 
-如果每个请求都重新计算固定前缀，会浪费 prefill 计算。
+如果只用随机 prompt，就无法评价 APC。
 
-Prefix Caching 的思路是：
+## 4. Speculative Decoding 的真实目标
+
+普通 decode：
 
 ```text
-相同前缀已经算过 KV Cache，就直接复用。
+target forward -> 1 个新 token
 ```
 
-简化示意：
+投机解码：
 
 ```text
-request A:
-  [system prompt][tools][用户问题 A]
-
-request B:
-  [system prompt][tools][用户问题 B]
-
-共享部分：
-  [system prompt][tools]
+proposer 给出多个候选
+  -> target 一次验证候选序列
+  -> 接受连续正确部分
+  -> 拒绝点后修正并继续
 ```
 
-如果共享前缀命中，就可以减少 prefill token 数。
+它的目标是减少昂贵 target model 的串行 decode 轮数。收益取决于：
 
-## 3. Prefix Caching 为什么依赖 KV block？
+- proposer 延迟；
+- 接受长度/acceptance rate；
+- target 验证多个 token 的成本；
+- batch/QPS；
+- 额外模型、hidden states 和 KV 的显存；
+- 采样策略、模型族和 prompt 类型。
 
-vLLM 的 KV Cache 是 block 化管理的。
+在高 QPS、target 已被大 batch 充分利用时，额外 proposer/verification 工作可能降低总吞吐。
 
-Prefix Caching 通常不是按字符或字符串复用，而是按 token/block 复用已经计算完成的 KV。
+## 5. v0.25.0 的 speculative 配置入口
 
-可以理解为：
+统一使用 `--speculative-config` JSON：
+
+```bash
+vllm serve <target-model> \
+  --speculative-config '{
+    "method":"draft_model",
+    "model":"<draft-model>",
+    "num_speculative_tokens":5
+  }'
+```
+
+v0.25.0 的 `SpeculativeConfig` 支持多种 proposer，包括 EAGLE/EAGLE3、MTP、draft model、MLP speculator、n-gram、suffix 等。不同方法有不同必需字段和兼容性，不要复用一份 JSON 猜配置。
+
+还要检查 async scheduling：v0.25.0 对部分 speculative 方法支持异步调度，其他组合会自动关闭或在显式强制开启时失败。启动日志必须记录最终 `async_scheduling` 状态，不能把它作为未控制变量混进性能对比。
+
+## 6. Spec decode 应怎样验收？
+
+固定 target model、采样参数和 workload，对比：
 
 ```text
-prefix tokens -> hash / match -> 找到已计算 KV blocks -> 引用这些 blocks
+baseline
+spec tokens = 1 / 3 / 5（在方法支持范围内）
 ```
 
-这就要求：
+至少记录：
 
-1. 前缀 token 必须一致。
-2. 对应 KV block 已经计算完成。
-3. block 可以被安全共享。
-4. ref count 正确维护。
+- TTFT、TPOT/ITL、E2E；
+- output tokens/s 与 requests/s；
+- accepted tokens / proposed tokens；
+- target verification batch 形状；
+- 额外显存和启动时间；
+- greedy 输出一致性或任务质量。
 
-所以 Prefix Caching 不是单独功能，它依赖前面讲过的 Block Manager。
+不要只看“每次接受几个 token”；系统目标是满足质量约束下的 latency/goodput。
 
-## 4. Prefix Caching 适合什么场景？
+## 7. 权重量化在 v0.25.0 中如何进入系统？
 
-适合：
+权重量化格式通常由 checkpoint 配置识别，也可通过 `--quantization` 指定：
+
+```bash
+vllm serve <quantized-model> --quantization <method>
+```
+
+v0.25.0 文档列出的实现包括 AWQ、GPTQModel、BitsAndBytes、LLM Compressor、ModelOpt、TorchAO 等；硬件支持矩阵不同。格式名称相同也不意味着在所有 GPU 上使用相同 kernel。
+
+量化可能带来：
+
+- 权重显存下降，模型更容易放入单卡；
+- 为 KV Cache 留出更多显存；
+- 某些硬件/形状上减少带宽并提高吞吐；
+- 反量化、fallback kernel 或小 batch 下额外开销；
+- 精度/质量变化。
+
+所以“显存更小”不能直接推出“延迟更低”。
+
+## 8. KV Cache 量化与权重量化不同
+
+KV dtype 由 `--kv-cache-dtype` 控制：
+
+```bash
+vllm serve <model> --kv-cache-dtype fp8
+```
+
+标准 BF16/FP16 KV 变为 FP8 后，理论单 token KV 容量大致减半，因此同一 pool 可容纳更多 tokens。真实收益还受 backend、page padding、混合 attention、scale 和 kernel 支持影响。
+
+量化 scale 应优先使用与 checkpoint/校准流程匹配的数据。默认 scale 或临时校准不应在未做质量评估时直接进入生产。
+
+需要同时验证：
+
+- 最大可容纳 token 数和 preemption；
+- TTFT/TPOT/吞吐；
+- 长上下文任务质量；
+- 实际 attention backend 是否支持期望的 FP8 路径；
+- 是否存在 dtype conversion/fallback。
+
+## 9. 推荐学习顺序
+
+三者不要同时开启。建议：
 
 ```text
-固定 system prompt
-固定工具说明
-固定 few-shot 模板
-RAG 模板前缀一致
-Agent 工作流上下文大量重复
-批量请求共享长前缀
+1. APC：最容易构造确定性 shared-prefix workload
+2. 权重或 KV 量化：先做容量与质量基线
+3. Spec decode：最后分析 proposer、acceptance 与异步调度
 ```
 
-不适合：
+每次只改变一个能力，否则无法判断指标变化来自：
 
 ```text
-每个请求前缀都完全不同
-prompt 很短
-用户输入变化发生在最前面
-缓存命中率很低
+缓存命中
+模型/KV dtype
+backend/kernel
+spec proposer
+async scheduling
+CUDA Graph
 ```
 
-Prefix Caching 的收益高度依赖命中率。
+## 10. 三个最小实验
 
-如果命中率低，它不仅收益有限，还会带来缓存管理开销。
+### 10.1 APC
 
-## 5. Prefix Caching 的后端类比
+- 4K 相同前缀、32 token 输出；
+- APC on/off；
+- 记录 cached tokens、TTFT、input throughput；
+- 再用 unique-prefix 作为负对照。
 
-它很像缓存系统：
+### 10.2 KV FP8
 
-```text
-Redis cache：
-  key 命中 -> 少查 DB
-  key 未命中 -> 走完整计算，再写缓存
+- 相同权重 checkpoint；
+- `kv_cache_dtype=auto` 对比 `fp8`；
+- 固定 arrival rate 和长度分布；
+- 比较容量、preemption、TPOT 与质量。
 
-Prefix cache：
-  prefix 命中 -> 少做 prefill
-  prefix 未命中 -> 正常 prefill，再记录可复用 KV
-```
+### 10.3 Spec decode
 
-也像游戏服务器里的配置/地图资源共享：
+- 低 QPS 的长输出 workload；
+- baseline 对比一种受支持 proposer；
+- 记录 acceptance、TPOT、额外显存；
+- 再提高 QPS，观察收益是否消失。
 
-```text
-多个玩家共享同一份地图静态数据。
-玩家自己的动态状态另算。
-```
+## 11. 源码核对入口
 
-区别是 Prefix Cache 缓的是 GPU KV Cache，不是普通 CPU 对象。
+### Prefix caching
 
-## 6. Speculative Decoding 解决什么问题？
+- `vllm/v1/core/kv_cache_utils.py`：block hash。
+- `vllm/v1/core/block_pool.py`：hash mapping、free queue、eviction。
+- `vllm/v1/core/kv_cache_manager.py`：命中查询与 slots 分配。
+- `vllm/config/cache.py`：prefix hash 和 KV dtype 配置。
 
-LLM decode 阶段是一 token 一 token 生成。
+### Speculative decoding
 
-```text
-大模型生成 token 1
-大模型生成 token 2
-大模型生成 token 3
-...
-```
+- `vllm/config/speculative.py`：`SpeculativeConfig` 与方法兼容性。
+- `vllm/v1/spec_decode/`：proposer、rejection sampling 和验证路径。
+- `vllm/v1/core/sched/scheduler.py`：spec tokens 的调度与状态更新。
+- `vllm/config/vllm.py`：spec decode 与 async scheduling 兼容性。
 
-每一步都要跑大模型，成本很高。
+### Quantization
 
-Speculative Decoding 的思路是：
+- `vllm/model_executor/layers/quantization/`：量化方法注册与实现。
+- `vllm/config/model.py`：模型量化配置解析。
+- `vllm/config/cache.py`：KV Cache dtype 与 scales。
+- `vllm/v1/attention/backends/`：backend 对 KV dtype 的实际支持。
 
-```text
-先用较便宜的方法猜多个 token，再让大模型一次性验证。
-```
+## 12. 自检题
 
-常见形式是 draft model + target model：
-
-```text
-draft model：快速猜 token A B C D
-
-target model：验证 A B C D 是否可接受
-```
-
-如果猜得准，大模型一次 forward 可以确认多个 token，从而减少 decode 轮数。
-
-## 7. Speculative Decoding 的简化流程
-
-简化流程：
-
-```text
-1. draft model 生成 k 个候选 token
-2. target model 对这些 token 做验证
-3. 接受前面连续正确的一段
-4. 如果遇到不接受的 token，从 target model 分布重新采样
-5. 进入下一轮
-```
-
-例如：
-
-```text
-draft 猜：A B C D
-
-target 验证：A 接受，B 接受，C 拒绝
-
-最终接受：A B
-然后根据 target 分布采样一个替代 C 的 token
-```
-
-核心收益来自：
-
-```text
-一次 target model forward 尽量产出多个有效 token。
-```
-
-## 8. Speculative Decoding 的收益条件
-
-它不是必然加速。
-
-收益取决于：
-
-1. draft model 是否足够快。
-2. draft token 接受率是否足够高。
-3. target model 验证开销是否划算。
-4. batch 形态是否适合。
-5. 系统是否有额外显存放 draft model。
-
-如果 draft 很慢，或者接受率很低，可能反而变慢。
-
-可以用公式直觉理解：
-
-```text
-收益 ≈ 多接受 token 带来的 target decode 轮数减少
-     - draft model 额外开销
-     - 验证和调度开销
-```
-
-## 9. Speculative Decoding 的工程代价
-
-工程上它会增加复杂度：
-
-1. 需要管理 draft model。
-2. 需要额外显存。
-3. Scheduler 要支持特殊解码流程。
-4. KV Cache 状态更复杂。
-5. 输出 token 接受/拒绝会影响请求状态更新。
-
-所以它不是“打开一定更快”的开关。
-
-适合先在固定 workload 上压测，再决定是否用于线上。
-
-## 10. Quantization 解决什么问题？
-
-Quantization 即量化。
-
-它的核心思想是：
-
-```text
-用更低 bit 表示模型权重、激活或 KV Cache，从而降低显存占用和内存带宽压力。
-```
-
-常见：
-
-```text
-FP16 / BF16
-FP8
-INT8
-INT4
-GPTQ
-AWQ
-bitsandbytes
-KV Cache quantization
-```
-
-不同量化方式优化对象不同。
-
-## 11. 权重量化
-
-权重量化主要减少模型权重显存。
-
-例如把 FP16 权重压到 INT8 或 INT4。
-
-收益：
-
-1. 模型更容易放进单卡。
-2. 可以给 KV Cache 留更多显存。
-3. 某些硬件和 kernel 下吞吐可能提升。
-
-代价：
-
-1. 可能有精度损失。
-2. kernel 支持依赖硬件和后端。
-3. 某些量化格式加载和部署更复杂。
-
-## 12. KV Cache 量化
-
-KV Cache 量化针对的是在线推理中动态增长的 KV。
-
-为什么重要？
-
-```text
-KV Cache 大小 ∝ batch_size × sequence_length × layers × kv_heads × head_dim × dtype_size
-```
-
-如果把 KV Cache 从 FP16 降到更低精度，显存和带宽压力会下降。
-
-收益：
-
-1. 支持更高并发。
-2. 支持更长上下文。
-3. decode 读取 KV 的带宽压力降低。
-
-代价：
-
-1. 可能影响输出质量。
-2. 需要 attention backend 支持。
-3. 不同模型对 KV 精度敏感度不同。
-
-## 13. 量化不是只看“显存变小”
-
-量化可能带来三种结果：
-
-```text
-显存下降，速度提升
-显存下降，速度差不多
-显存下降，速度反而下降
-```
-
-为什么会反而下降？
-
-1. 反量化开销大。
-2. kernel 不够优化。
-3. 硬件不擅长某种低精度。
-4. batch 太小，收益被 overhead 抵消。
-
-所以量化必须压测。
-
-不能只看模型文件大小。
-
-## 14. 三者分别影响哪些指标？
-
-| 能力 | 主要优化 | 主要影响指标 | 风险 |
-|---|---|---|---|
-| Prefix Caching | 减少重复 prefill | TTFT、prefill 吞吐 | 命中率低则收益小 |
-| Speculative Decoding | 减少 target decode 轮数 | TPOT、输出吞吐 | draft 开销、接受率不足 |
-| Quantization | 降低显存/带宽压力 | 并发、吞吐、部署成本 | 精度损失、kernel 支持 |
-
-## 15. 如何选择优先级？
-
-如果你的业务是固定 system prompt + 工具调用：
-
-```text
-优先看 Prefix Caching
-```
-
-如果你的业务 decode 很长，且有合适 draft model：
-
-```text
-尝试 Speculative Decoding
-```
-
-如果你的模型太大、显存紧张、上下文长：
-
-```text
-优先看 Quantization / KV Cache dtype
-```
-
-如果你刚开始学习：
-
-```text
-先理解 Prefix Caching
-再理解 Quantization
-最后再研究 Speculative Decoding
-```
-
-因为 Prefix Caching 和前面学的 KV block 关系最直接。
-
-## 16. 一个后端视角的决策框架
-
-不要问：
-
-```text
-这个功能快不快？
-```
-
-要问：
-
-```text
-我的 workload 是否匹配它？
-```
-
-可以按下面检查：
-
-```text
-1. prompt 是否大量重复？
-   是 -> Prefix Caching 可能有收益
-
-2. 输出是否很长？
-   是 -> Speculative Decoding 可能有收益
-
-3. 显存是否限制并发或上下文？
-   是 -> Quantization / KV Cache 量化可能有收益
-
-4. 当前瓶颈是 TTFT、TPOT、吞吐还是 OOM？
-   不同瓶颈用不同手段
-```
-
-## 17. 读源码时看什么？
-
-### 17.1 Prefix Caching
-
-关键词：
-
-```text
-prefix_cache
-automatic_prefix_caching
-hash
-computed_block
-block_table
-ref_count
-```
-
-关注：
-
-1. prefix 如何 hash。
-2. block 如何判定可复用。
-3. ref count 如何维护。
-4. cache miss 后如何写入。
-
-### 17.2 Speculative Decoding
-
-关键词：
-
-```text
-spec_decode
-speculative
-draft_model
-target_model
-acceptance
-proposal
-```
-
-关注：
-
-1. draft token 如何产生。
-2. target 如何验证。
-3. 接受/拒绝如何更新输出。
-4. KV Cache 如何保持一致。
-
-### 17.3 Quantization
-
-关键词：
-
-```text
-quantization
-awq
-gptq
-bitsandbytes
-fp8
-kv_cache_dtype
-```
-
-关注：
-
-1. 权重加载时如何选择量化方法。
-2. kernel 是否支持对应 dtype。
-3. KV Cache dtype 如何影响 attention backend。
-4. 精度和性能如何压测。
-
-## 18. 本文小结
-
-第二阶段最后，你要把这三个能力放到 vLLM 主链路里理解：
-
-```text
-Prefix Caching：和 KV Cache / Block Manager 强相关，减少重复 prefill。
-
-Speculative Decoding：和 Scheduler / Model Runner / Sampler 强相关，减少 target model decode 轮数。
-
-Quantization：和模型加载 / Attention Backend / KV Cache 强相关，降低显存和带宽压力。
-```
-
-它们不是孤立功能，而是分别插在 vLLM 的不同层：
-
-```text
-API / Engine
-  -> Scheduler
-  -> KV Cache Manager / Prefix Cache
-  -> Model Runner
-  -> Attention Backend / Quantized Kernel
-  -> Sampler / Spec Decode
-  -> Output
-```
-
-到这里，第二阶段的关键模块已经完成：
-
-1. Scheduler：调度。
-2. Block Manager：KV 资源管理。
-3. Model Runner：模型执行入口。
-4. Attention Backend：核心 attention 实现。
-5. Prefix / Spec Decode / Quantization：高级优化能力。
-
-下一阶段就可以进入岗位导向：源码阅读、压测、瓶颈定位、框架对比，以及从 C++ 游戏后端迁移到 AI 推理岗位的路线。
+1. APC 为什么主要降低 TTFT，而不是长输出 TPOT？
+2. `ref_cnt=0` 的 cached block 为什么没有独占一份额外 cache pool？
+3. speculative acceptance 高为什么仍不保证系统吞吐提高？
+4. 权重量化与 KV 量化分别改变哪部分容量？
+5. 为什么比较 spec decode 时必须记录 async scheduling 的最终状态？
 
 ## 参考资料
 
-- vLLM Automatic Prefix Caching：https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html
-- vLLM Speculative Decoding：https://docs.vllm.ai/en/latest/features/spec_decode.html
-- vLLM Quantization：https://docs.vllm.ai/en/latest/features/quantization/
-- PagedAttention 论文：https://arxiv.org/abs/2309.06180
-- Speculative Decoding 论文：https://arxiv.org/abs/2211.17192
+- [vLLM v0.25.0 Automatic Prefix Caching](https://docs.vllm.ai/en/v0.25.0/features/automatic_prefix_caching/)
+- [vLLM v0.25.0 Prefix Caching Design](https://docs.vllm.ai/en/v0.25.0/design/prefix_caching/)
+- [vLLM v0.25.0 Speculative Decoding](https://docs.vllm.ai/en/v0.25.0/features/speculative_decoding/)
+- [vLLM v0.25.0 Quantization](https://docs.vllm.ai/en/v0.25.0/features/quantization/)
+- [vLLM v0.25.0 Quantized KV Cache](https://docs.vllm.ai/en/v0.25.0/features/quantization/quantized_kvcache/)

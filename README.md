@@ -37,19 +37,19 @@
 
 ### 第二阶段：深入关键模块
 
-6. [Scheduler：continuous batching、prefill/decode 混排、chunked prefill](docs/06-scheduler-continuous-batching.md)
-7. [Block Manager：KV block 分配、回收、共享与抢占](docs/07-block-manager-kv-cache.md)
-8. [Model Runner：一次 forward 前后到底发生了什么](docs/08-model-runner-forward.md)
-9. [Attention Backend：FlashAttention、PagedAttention kernel 与 CUDA Graph](docs/09-attention-backend.md)
-10. [Prefix Caching、Speculative Decoding 与 Quantization](docs/10-prefix-speculative-quantization.md)
+6. [Scheduler：v0.25.0 的 continuous batching 与 chunked prefill](docs/06-scheduler-continuous-batching.md)
+7. [KV Cache Manager：v0.25.0 的 block 分配、缓存与抢占](docs/07-block-manager-kv-cache.md)
+8. [Model Runner：v0.25.0 一次 forward 前后发生什么](docs/08-model-runner-forward.md)
+9. [Attention Backend：v0.25.0 的分页 KV、kernel 与 CUDA Graph](docs/09-attention-backend.md)
+10. [v0.25.0 的 Prefix Caching、Speculative Decoding 与 Quantization](docs/10-prefix-speculative-quantization.md)
 
 ### 第三阶段：面向岗位能力
 
-11. [如何读 vLLM 源码：从请求生命周期切进去](docs/11-how-to-read-vllm-source.md)
-12. [如何压测 vLLM：不要只看 tokens/s](docs/12-how-to-benchmark-vllm.md)
-13. [如何定位 GPU / CPU / 网络瓶颈](docs/13-how-to-debug-bottlenecks.md)
-14. [vLLM vs TensorRT-LLM vs SGLang](docs/14-vllm-vs-tensorrt-llm-vs-sglang.md)
-15. [从 C++ 游戏后端转 AI 推理：能力迁移路线](docs/15-cpp-game-backend-to-ai-inference.md)
+11. [如何读 vLLM v0.25.0 源码：追踪一条请求](docs/11-how-to-read-vllm-source.md)
+12. [如何压测 vLLM v0.25.0：从吞吐到 goodput](docs/12-how-to-benchmark-vllm.md)
+13. [如何定位 vLLM v0.25.0 的 GPU、CPU、KV 与网络瓶颈](docs/13-how-to-debug-bottlenecks.md)
+14. [以 vLLM v0.25.0 为基线比较 TensorRT-LLM 与 SGLang](docs/14-vllm-vs-tensorrt-llm-vs-sglang.md)
+15. [从 C++/Go 后端转 AI 推理：基于 vLLM v0.25.0 的实践路线](docs/15-cpp-game-backend-to-ai-inference.md)
 
 ## 下一步实践建议
 

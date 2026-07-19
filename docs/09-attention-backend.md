@@ -1,357 +1,237 @@
-# 09｜Attention Backend：FlashAttention、PagedAttention kernel 与 CUDA Graph
+# 09｜Attention Backend：v0.25.0 的分页 KV、kernel 与 CUDA Graph
 
-这一篇进入更靠近 GPU 的部分：Attention Backend。
+> 版本基线：vLLM v0.25.0，源码 commit `702f4814fe54fabff350d43cb753ae3e47c0c276`。本文不把历史 PagedAttention CUDA kernel 当成当前唯一实现；backend 选择和能力必须以启动日志、`AttentionBackendEnum` 与 v0.25.0 feature table 为准。
 
-一句话概括：
+## 1. Attention Backend 解决什么？
 
-```text
-Attention Backend 负责选择和执行具体的 attention 实现，让模型在不同硬件、不同 batch 形态、不同 KV Cache 布局下尽量高效地完成注意力计算。
-```
-
-如果 Model Runner 是“组织模型输入”，那 Attention Backend 就是“真正把 attention 算快”。
-
-## 1. 为什么 attention 是推理核心？
-
-Transformer 的一层大致包含：
+模型层表达的是 attention 语义：
 
 ```text
-Attention
-MLP
-Norm
-Residual
+Q, K, V
+  -> 写入本轮 K/V
+  -> 读取当前请求的历史 K/V
+  -> causal / sliding-window / MLA 等 attention
+  -> output
 ```
 
-LLM 推理时，attention 特别关键，因为它和上下文长度强相关。
+Attention Backend 把这些语义映射到具体硬件、数据布局和 kernel。它要同时适配：
 
-生成第 N 个 token 时，模型需要关注前面已经存在的 token：
+- CUDA/ROCm/XPU 等平台；
+- MHA/GQA/MLA、full/sliding-window/hybrid attention；
+- prefill、mixed batch、uniform decode、speculative verification；
+- 不同 KV dtype 和 block size；
+- CUDA Graph 能力；
+- prefix cache、KV connector 等功能组合。
+
+所以“vLLM 使用 PagedAttention kernel”过于笼统。v0.25.0 有 backend registry、统一接口和多种实现。
+
+## 2. FlashAttention 与 PagedAttention 不是同一维度
+
+### FlashAttention
+
+主要描述 attention 计算的 IO-aware 实现：通过 tiling 和融合减少 HBM 往返，避免显式物化完整 attention matrix。
+
+### Paged KV / PagedAttention
+
+主要描述历史 KV 的分页存储与寻址：请求的逻辑 token 连续，但物理 KV pages 可以离散，由 block table 映射。
+
+在 vLLM 中二者可以组合：某个 FlashAttention backend 同时接受 paged KV 的 block table，并通过 slot mapping 把新 K/V scatter 到预分配 cache。
+
+不要把它们理解成二选一：
 
 ```text
-当前 token -> query
-历史 token -> key/value from KV Cache
-attention -> 当前 hidden state
+FlashAttention：如何高效计算
+Paged KV：历史 K/V 如何布局与定位
 ```
 
-上下文越长，decode 阶段读取历史 KV 的成本越高。
-
-所以 LLM Serving 的很多优化都围绕 attention 展开。
-
-## 2. prefill attention 和 decode attention 不一样
-
-### 2.1 prefill
-
-prefill 一次处理 prompt 中的一批 token。
+把读写路径放在一张图里：
 
 ```text
-输入长度：可能是几百、几千、几万 token
-计算形态：大块矩阵计算
-主要目标：尽快完成首轮上下文处理，降低 TTFT
+当前 token ──> Q, K, V
+              │  │  │
+              │  └──┴─ + slot mapping ──> KV cache update ──┐
+              │              （写路径）                       │
+              │                                              ▼
+              │                         ┌── 预分配 GPU KV Pool ──┐
+              │                         │ P7 │ P2 │ P11 │ ...    │
+              │                         └─────────┬──────────────┘
+              │                                   │ 历史 K/V
+              │  + block table                    │
+              │  （逻辑 block -> 物理 page）       │
+              ▼                                   ▼
+                     Attention Backend
+                              │
+                              ▼
+                       attention output
+
+  写新 K/V 看 slot mapping；读历史 K/V 看 block table。
 ```
 
-prefill 阶段常见优化是使用高效 attention 算法，例如 FlashAttention 类实现。
+## 3. v0.25.0 的 backend 选择
 
-### 2.2 decode
+配置入口是 `--attention-backend`，对应 `vllm/v1/attention/backends/registry.py` 中的枚举与注册表：
 
-decode 每轮通常每个请求只生成一个 token。
+```bash
+vllm serve <model> --attention-backend FLASH_ATTN
+```
+
+通常应先让 vLLM 自动选择。显式指定 backend 之前要确认：
+
+- 当前 GPU 架构和已安装库支持；
+- 模型 head size、dtype、attention 类型支持；
+- KV Cache dtype 支持；
+- prefix caching、spec decode、sliding window 等功能支持；
+- CUDA Graph 支持级别；
+- 选择没有触发回退或启动失败。
+
+不要根据 backend 名字猜性能。相同 backend 在不同模型、batch 形状、上下文长度和硬件上可能走不同 kernel。
+
+## 4. 写路径：新 K/V 如何进入分页缓存？
+
+以标准 paged KV 路径为例，Runner 为本轮 token 提供 slot mapping：
 
 ```text
-输入：当前 token
-历史：完整 KV Cache
-计算形态：小 query + 大量历史 KV 读取
-主要目标：降低 TPOT，提高输出 token 吞吐
+slot = physical_block_id * block_size + offset
 ```
 
-decode 阶段最关键的是高效读取 KV Cache。
+每层产生新 K/V 后，backend 的 KV cache update 路径按 slot 把它们 scatter 到该层预分配的 KV tensor。`vllm/v1/attention/ops/paged_attn.py` 和不同 backend 的 `do_kv_cache_update()` 展示了这层接口。
 
-PagedAttention 主要就是为这种分页 KV Cache 布局服务。
+slot mapping 服务的是“本轮写哪里”，不能替代 block table。
 
-## 3. FlashAttention 解决什么问题？
+## 5. 读路径：历史 K/V 如何参与 attention？
 
-普通 attention 如果直接算，会产生很大的中间矩阵：
+block table 保存：
 
 ```text
-QK^T -> attention scores -> softmax -> AV
+request row + logical block index -> physical block ID
 ```
 
-当序列很长时，中间 attention matrix 很大，显存访问成本高。
+backend 结合 block table、sequence length、query start location 等元数据读取历史 pages。逻辑序列 `[0..N)` 不要求对应连续 physical blocks。
 
-FlashAttention 的核心思想可以粗略理解为：
+因此：
 
 ```text
-通过分块计算和融合，减少 HBM 读写，避免显式存储完整 attention matrix。
+slot mapping：新 K/V 写路径
+block table：历史 K/V 读路径
 ```
 
-重点不是“数学变了”，而是“计算组织方式变了”。
+具体 backend 可能对 block table 做转换、建立额外 workspace，或针对 prefill/decode 使用不同 kernel；不要假设所有实现都完全共享一种 tensor 形状。
 
-它让 attention 更接近 GPU 友好的执行方式：
+## 6. Prefill、mixed 与 decode
 
-1. 分块加载 Q/K/V。
-2. 在 SRAM / shared memory 中做更多计算。
-3. 减少对 GPU 全局显存的反复读写。
-4. 提升长序列 prefill 的效率。
+### Prefill
 
-## 4. PagedAttention kernel 解决什么问题？
+- query token 多；
+- attention 计算规模大；
+- 常更偏 compute-heavy；
+- 关注 TTFT、input tokens/s 和大矩阵 kernel 效率。
 
-vLLM 的 KV Cache 不是为每个请求分配连续大块显存，而是分页成 block。
+### Uniform decode
 
-所以 attention kernel 不能简单假设：
+- 普通路径通常每请求一个 query token；
+- 需要扫描越来越长的历史 KV；
+- 常更偏 memory-bandwidth/launch-overhead；
+- 关注 ITL/TPOT 和 output tokens/s。
+
+### Mixed batch
+
+chunked prefill 与 decode 可以同轮执行。backend 必须根据 metadata 正确处理非均匀 query lengths；这也是 CUDA Graph 能力不能只用 batch size 描述的原因。
+
+## 7. v0.25.0 的 CUDA Graph 模式
+
+CUDA Graph 通过 capture/replay 降低重复执行形状下的 CPU 和 kernel launch 开销。它不减少 GEMM/attention 的数学工作，也不增加 KV 容量。
+
+v0.25.0 的 `CUDAGraphMode` 包含：
+
+- `NONE`：不使用 CUDA Graph；
+- `PIECEWISE`：attention 等不兼容部分留在图外；
+- `FULL`：完整图；
+- `FULL_DECODE_ONLY`：只为 uniform decode 使用 full graph；
+- `FULL_AND_PIECEWISE`：decode full graph，其他 batch 使用 piecewise。
+
+V1 默认 optimization level 是 O2，配置可采用 `FULL_AND_PIECEWISE`，但最终会根据模型和 attention backend 的 `AttentionCGSupport` 自动调整。不能仅凭“默认 O2”断言所有请求都 replay full CUDA Graph。
+
+调试基线：
+
+```bash
+vllm serve <model> --enforce-eager
+```
+
+精确控制示例：
+
+```bash
+vllm serve <model> \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+```
+
+## 8. CUDA Graph 为什么需要 batch descriptor？
+
+v0.25.0 使用 `BatchDescriptor` 描述可复用执行形状，核心信息包括 token 数、请求数和 batch 是否 uniform。dispatcher 根据当前 batch 和已经捕获的 keys，在 FULL、PIECEWISE 与 NONE 之间选择。
+
+动态请求仍然能使用 CUDA Graph，是因为系统只对支持的形状做 capture/replay，并把输入写入固定或可复用 buffer；无法匹配时可以回退 eager/piecewise。
+
+代价包括：
+
+- 启动 warmup/capture 时间；
+- graph 与 workspace 显存；
+- 多种 batch shape 的捕获集合；
+- backend/功能不兼容时的降级；
+- 调试时间线更复杂。
+
+## 9. 性能判断顺序
+
+不要看到 TPOT 高就直接换 backend。建议依次检查：
+
+1. workload 的输入/输出长度与 arrival rate；
+2. waiting queue、KV usage 和 preemption；
+3. 实际选择的 backend、dtype、runner 和 graph mode；
+4. Nsight Systems 中 CPU/GPU 空洞与同步点；
+5. 主要 kernel 占时及调用形状；
+6. 最后才用 Nsight Compute 分析带宽、occupancy、warp stalls。
+
+## 10. 最小对照实验
+
+固定模型、GPU 和 workload，运行：
 
 ```text
-request A 的 KV Cache 在物理显存上连续排列
+A. 自动 backend + 默认 O2
+B. 自动 backend + --enforce-eager
+C. 一个确认兼容的显式 backend + 默认 O2
 ```
 
-它需要通过 block table 找到真实物理 block。
-
-简化理解：
-
-```text
-for each request:
-    for each logical block in history:
-        physical_block = block_table[logical_block]
-        read K/V from physical_block
-        compute attention
-```
-
-PagedAttention kernel 的价值是：
-
-```text
-在 KV Cache 物理不连续的前提下，仍然高效完成 attention。
-```
-
-这就是 vLLM 内存管理和 attention kernel 必须配合的原因。
-
-## 5. block table 为什么会进入 kernel 路径？
-
-因为逻辑 token 到物理显存的映射不是固定连续的。
-
-例如：
-
-```text
-request A logical blocks:
-  0 -> physical block 102
-  1 -> physical block 7
-  2 -> physical block 88
-```
-
-attention 读取历史 KV 时必须知道这些映射。
-
-所以 block table 不是普通业务元数据，而是执行路径上的关键数据。
-
-这会带来一个工程权衡：
-
-```text
-分页管理提升了显存利用率，但 kernel 需要支持间接寻址。
-```
-
-这也是为什么 vLLM 的高性能不只来自调度，还来自内存布局和 kernel 实现协同。
-
-## 6. Attention Backend 是什么？
-
-Attention Backend 可以理解为 attention 实现的适配层。
-
-不同场景可能使用不同 backend：
-
-```text
-prefill: 适合 FlashAttention 类实现
-
-decode: 适合 PagedAttention / paged KV cache kernel
-
-不同硬件: NVIDIA / AMD / CPU / TPU 可能有不同实现
-
-不同模型: MLA、GQA、MHA、滑动窗口、量化 KV 也会影响选择
-```
-
-Backend 层存在的意义是：
-
-```text
-上层模型不应该到处写硬件和 kernel 分支，而是通过统一接口调用合适的 attention 实现。
-```
-
-## 7. GQA / MQA 对 attention 有什么影响？
-
-现代 LLM 常见：
-
-```text
-MHA：Multi-Head Attention
-MQA：Multi-Query Attention
-GQA：Grouped-Query Attention
-```
-
-区别可以粗略理解为：
-
-```text
-MHA：每个 query head 有自己的 key/value head
-MQA：多个 query head 共享一组 key/value
-GQA：一组 query head 共享一组 key/value
-```
-
-GQA/MQA 的好处是减少 KV Cache 体积。
-
-因为 KV head 数变少了：
-
-```text
-KV Cache 大小 ∝ num_kv_heads
-```
-
-这会直接影响：
-
-1. 显存占用。
-2. KV 读取带宽。
-3. attention kernel 的输入布局。
-4. 最大可服务并发。
-
-所以 attention backend 必须理解模型的 head 结构。
-
-## 8. CUDA Graph 在 Attention Backend 周围的作用
-
-LLM decode 阶段会执行非常多轮。
-
-如果每一轮都从 CPU 发起大量 kernel launch，会产生明显 overhead。
-
-CUDA Graph 的思路是：
-
-```text
-先捕获一段固定形态的 CUDA 执行图
-后续重复 replay
-```
-
-它的收益主要是降低 CPU launch overhead。
-
-但是 CUDA Graph 要求执行形态相对稳定。
-
-vLLM 的难点在于：
-
-```text
-Scheduler 需要动态 batch，CUDA Graph 喜欢静态形状。
-```
-
-所以 vLLM 需要在动态调度和静态图复用之间做工程折中。
-
-## 9. 为什么 attention backend 会影响调参？
-
-一些参数会改变 batch 形态和 KV 形态，从而影响 backend 效率。
-
-### 9.1 `--max-num-batched-tokens`
-
-它影响 prefill batch token 数。
-
-如果 token budget 变大，prefill 可能更容易形成大计算块，但单轮耗时也会变长。
-
-### 9.2 `--max-num-seqs`
-
-它影响 decode 阶段并发序列数。
-
-序列数太小，decode batch 小，GPU 可能吃不满。
-
-序列数太大，KV Cache 压力和调度开销上升。
-
-### 9.3 `--block-size`
-
-block size 会影响 KV Cache 分页粒度。
-
-它既影响显存碎片，也影响 block table 长度和 kernel 间接访问形态。
-
-### 9.4 `--dtype` / `--kv-cache-dtype`
-
-精度影响显存占用和带宽压力。
-
-例如 KV Cache 量化可以降低显存和带宽压力，但可能引入精度和 kernel 支持问题。
-
-## 10. 从 CUDA 视角看 attention 优化
-
-如果你后面要往 CUDA/HPC 深挖，可以重点关注这些点：
-
-1. global memory 读写次数。
-2. shared memory / register 使用。
-3. warp-level 并行组织。
-4. memory coalescing。
-5. tensor core 使用。
-6. kernel fusion。
-7. launch overhead。
-8. 不同 batch shape 下的 occupancy。
-
-但第二阶段不要急着写 kernel。
-
-更好的顺序是：
-
-```text
-先理解 KV Cache 布局
-  -> 再理解 block table 如何传给 kernel
-  -> 再理解 prefill/decode attention 差异
-  -> 最后再看具体 CUDA kernel
-```
-
-## 11. 读源码时看什么？
-
-建议先围绕接口读，而不是一头扎进 `.cu` 文件。
-
-先看这些问题：
-
-1. vLLM 如何选择 attention backend？
-2. Model Runner 传给 attention 的元数据有哪些？
-3. block table 和 slot mapping 在哪里使用？
-4. prefill 和 decode 是否走不同 kernel？
-5. CUDA Graph 捕获的边界在哪里？
-6. 不同 dtype / kv cache dtype 如何影响 backend？
-
-关键词：
-
-```text
-attention_backend
-paged_attention
-flash_attention
-block_tables
-slot_mapping
-kv_cache
-cuda_graph
-```
-
-## 12. 和后端开发的类比
-
-Attention Backend 有点像网络库里的 IO backend：
-
-```text
-业务层：我要发包
-IO backend：epoll / kqueue / io_uring / IOCP
-```
-
-业务层不应该到处关心底层细节。
-
-vLLM 里也类似：
-
-```text
-模型层：我要做 attention
-Attention Backend：选择具体 kernel 和执行策略
-```
-
-区别是这里的 backend 面向 GPU kernel，而不是 OS IO。
-
-## 13. 本文小结
-
-Attention Backend 是 vLLM 性能链路里最靠近 GPU 的核心层之一。
-
-你需要记住：
-
-1. prefill 和 decode 的 attention 形态不同。
-2. FlashAttention 主要通过减少显存读写提升 attention 效率。
-3. PagedAttention kernel 让分页 KV Cache 布局可以高效参与 attention。
-4. block table 是执行路径上的关键元数据。
-5. CUDA Graph 可以减少 launch overhead，但和动态 batch 存在权衡。
-6. 想往 HPC/CUDA 深挖，attention backend 是非常值得研究的入口。
-
-到这里，vLLM 第二阶段的主链路已经串起来了：
-
-```text
-Scheduler 决定跑谁
-  -> Block Manager 管 KV block
-  -> Model Runner 组织 forward
-  -> Attention Backend 执行核心 attention
-```
+分两类 workload：
+
+- `input=128, output=512`：观察 decode/launch/KV 读取；
+- `input=4096, output=32`：观察 prefill 和 mixed batch。
+
+记录 TTFT、TPOT、吞吐、启动时间、峰值显存和 Nsight 时间线。验收目标是指出变化来自 backend、graph、batch shape 还是其他瓶颈，而不是只给最快配置。
+
+## 11. 源码核对入口
+
+- `vllm/v1/attention/backend.py`：backend 接口、metadata、KV cache update、CG support。
+- `vllm/v1/attention/backends/registry.py`：backend 注册与枚举。
+- `vllm/v1/attention/backends/flash_attn.py`：FlashAttention backend 示例。
+- `vllm/v1/attention/ops/paged_attn.py`：paged KV 写入操作入口。
+- `vllm/v1/attention/ops/`：Triton/平台相关 attention 与 cache ops。
+- `vllm/v1/worker/block_table.py`：V1 block table 与 slot mapping。
+- `vllm/v1/cudagraph_dispatcher.py`：CUDA Graph runtime dispatch。
+- `vllm/config/attention.py`：attention 配置。
+- `vllm/config/compilation.py`：编译与 CUDA Graph 模式。
+- `vllm/config/vllm.py`：optimization level 默认值和兼容性处理。
+
+## 12. 自检题
+
+1. FlashAttention 与 paged KV 分别解决什么问题？
+2. slot mapping 和 block table 为什么缺一不可？
+3. mixed batch 为什么比 uniform decode 更难复用 full CUDA Graph？
+4. `--enforce-eager` 能帮助区分哪类问题？
+5. 为什么不能说“vLLM v0.25.0 所有 attention 都走同一个 PagedAttention kernel”？
 
 ## 参考资料
 
-- vLLM 官方文档：https://docs.vllm.ai/
-- vLLM Attention Backend Feature Support：https://docs.vllm.ai/en/latest/design/attention_backend.html
-- vLLM Paged Attention 设计文档：https://docs.vllm.ai/en/latest/design/paged_attention.html
-- vLLM CUDA Graphs 设计文档：https://docs.vllm.ai/en/latest/design/cuda_graphs.html
-- FlashAttention 论文：https://arxiv.org/abs/2205.14135
-- PagedAttention 论文：https://arxiv.org/abs/2309.06180
+- [vLLM v0.25.0 Attention Backends](https://docs.vllm.ai/en/v0.25.0/design/attention_backends/)
+- [vLLM v0.25.0 CUDA Graphs](https://docs.vllm.ai/en/v0.25.0/design/cuda_graphs/)
+- [vLLM v0.25.0 Optimization Levels](https://docs.vllm.ai/en/v0.25.0/design/optimization_levels/)
+- [vLLM v0.25.0 Paged Attention 历史设计页](https://docs.vllm.ai/en/v0.25.0/design/paged_attention/)
+- [FlashAttention 论文](https://arxiv.org/abs/2205.14135)
+- [PagedAttention 论文](https://arxiv.org/abs/2309.06180)

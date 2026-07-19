@@ -1,375 +1,248 @@
-# 07｜Block Manager：KV block 分配、回收、共享与抢占
+# 07｜KV Cache Manager：v0.25.0 的 block 分配、缓存与抢占
 
-上一篇讲 Scheduler，这一篇讲它背后的核心资源：KV Cache block。
+> 版本基线：vLLM v0.25.0，源码 commit `702f4814fe54fabff350d43cb753ae3e47c0c276`。本文只把旧版 PagedAttention/Block Manager 设计作为历史背景，主线以 V1 `KVCacheManager`、`BlockPool` 和 `SingleTypeKVCacheManager` 的实际实现为准。
 
-如果把 Scheduler 类比成“调度器”，那 Block Manager / KV Cache Manager 就像“显存资源管理器”。
+## 1. 先修正术语
 
-一句话概括：
-
-```text
-Block Manager 负责把请求需要的 KV Cache 映射到 GPU 显存中的固定大小 block，并处理分配、释放、复用、共享和抢占。
-```
-
-## 1. 先理解 KV Cache 为什么重要
-
-Transformer 自回归生成时，每生成一个 token 都要关注历史 token。
-
-如果每一步都重新计算所有历史 token 的 Key/Value，成本会非常高。
-
-所以推理引擎会把历史 token 的 Key/Value 缓存下来：
+在 v0.25.0 V1 中，核心类不是一个统一的 `BlockManager`，而是：
 
 ```text
-prompt token -> 计算 K/V -> 写入 KV Cache
-new token    -> 只计算新 token 的 K/V，然后读取历史 KV 做 attention
+KVCacheManager
+  -> KVCacheCoordinator
+      -> SingleTypeKVCacheManager（按 cache spec 管请求 blocks）
+  -> BlockPool（block 对象、free queue、hash mapping）
 ```
 
-这就是 KV Cache。
+Scheduler 通过 `KVCacheManager` 查询已计算前缀、申请 slots、缓存完整 blocks 和释放请求。不同 attention 类型、混合 KV Cache、KV connector 等情况会通过 coordinator 和具体 manager 扩展。
 
-它的特点是：
-
-1. 随着序列长度增长。
-2. 随着并发请求数量增长。
-3. 占用 GPU 显存。
-4. 生命周期和请求强绑定。
-
-在线推理时，KV Cache 往往比你想象中更关键。
-
-## 2. 如果不用 block，会有什么问题？
-
-最朴素的做法是：每个请求预分配一大块连续显存。
-
-例如最大上下文是 8192：
+整体关系如下：
 
 ```text
-request A -> 预留 8192 token 的 KV 空间
-request B -> 预留 8192 token 的 KV 空间
-request C -> 预留 8192 token 的 KV 空间
+CPU 控制面
+
+  Scheduler
+      │ get_computed_blocks / allocate_slots / free
+      ▼
+  KVCacheManager
+      ├── BlockPool ─────────────── free queue / hash / ref_cnt
+      └── KVCacheCoordinator
+              └── SingleTypeKVCacheManager ── request -> block IDs
+                                                     │
+                                                     │ block IDs
+                                                     ▼
+Worker 执行面                                Block Table / Slot Mapping
+                                                     │
+                                                     ▼
+GPU 数据面                                     预分配 KV Tensor Pool
 ```
 
-但真实请求可能是：
+## 2. 两层“分配”必须分开
+
+### 2.1 启动阶段：建立真实 KV tensor pool
+
+Worker 在模型加载和显存 profiling 后确定 KV Cache 配置，并在 GPU 上创建真实 KV tensors。它不是每个请求到来后才调用一次大块 `cudaMalloc`。
+
+### 2.2 请求阶段：分配 CPU 侧 block ownership
+
+请求执行期间，Scheduler 分配的是 block IDs/slots：
 
 ```text
-A 实际只用了 200 token
-B 实际用了 600 token
-C 实际用了 7000 token
+request logical block 0 -> physical block 91
+request logical block 1 -> physical block 7
+request logical block 2 -> physical block 143
 ```
 
-这样会产生巨大浪费。
+Worker 随后把 block table 和写入位置转换为 attention backend 使用的元数据。
 
-类似游戏服务器里给每个玩家都预分配一个超大背包：
+因此以下两句话可以同时成立：
+
+- KV tensor pool 在启动时预分配。
+- 请求需要的 KV blocks 在运行时按增长分配。
+
+## 3. v0.25.0 的核心数据结构
+
+### 3.1 `KVCacheBlock`
+
+`vllm/v1/core/kv_cache_utils.py` 中的 block 记录：
+
+- 不变的 `block_id`；
+- 完整 block 可拥有的 `block_hash`；
+- 当前引用数 `ref_cnt`；
+- free queue 的前后指针。
+
+它是 CPU 侧账本对象，不等于某次请求新申请的一段 GPU 内存。
+
+### 3.2 `BlockPool`
+
+`BlockPool` 维护：
 
 ```text
-最大 10000 个道具格
-每个玩家登录时都直接占满 10000 格内存
+所有 KVCacheBlock 对象
+free block queue
+block_hash -> block IDs 的映射
 ```
 
-显然不合理。
+free queue 同时承担两种角色：
 
-另一个问题是外部碎片：
+- `ref_cnt == 0` 的 block 可以重新分配；
+- 如果它仍保留完整 block 的 hash，也可以在被驱逐前再次命中 prefix cache。
+
+所以“free”不等于立即清空缓存内容。
+
+### 3.3 请求到 blocks 的映射
+
+具体的 single-type manager 保存每个 request 的 block 列表。Scheduler 看到的是请求逻辑顺序；Worker/attention backend 通过 block table 找到物理页。
+
+## 4. 新请求如何获得 KV slots？
+
+主线是：
 
 ```text
-显存中有很多空洞，但没有一段足够大的连续空间给新请求。
+1. 对 prompt 的完整 token blocks 计算链式 hash
+2. get_computed_blocks() 查最长可复用前缀
+3. allocate_slots() 计算还需多少 blocks
+4. touch 命中的 blocks：增加 ref_cnt，必要时移出 free queue
+5. 从 free queue 取新 blocks
+6. 返回本轮新增 block IDs 给 Scheduler/Worker
 ```
 
-PagedAttention 的核心价值就是避免这种连续大块分配的问题。
+如果空间不足，`allocate_slots()` 返回 `None`，由 Scheduler 决定等待或抢占。
 
-## 3. vLLM 的 block 思想
+即使 prompt 全部命中，也不能凭 KV 直接得到“下一个 token”的 logits。v0.25.0 会至少保留最后一个 token 重新计算；因为 cache 只按完整 block 命中，实际重算可能覆盖最后一个完整 block。
 
-vLLM 把 KV Cache 拆成固定大小 block。
+## 5. Automatic Prefix Caching
 
-例如 block size = 16 tokens：
+v0.25.0 使用链式 block hash。身份包含：
 
 ```text
-逻辑 token 序列：
-0 1 2 ... 15 | 16 17 ... 31 | 32 ... 47
-
-逻辑 block：
-block 0       | block 1       | block 2
+parent block hash
++ current block token IDs
++ extra keys（LoRA、multi-modal hash、cache_salt 等）
 ```
 
-每个请求看到的是逻辑上连续的 token，但物理显存可以不连续：
+只缓存 full blocks。partial block 的 token 内容仍会增长，不进入稳定的可复用 hash 边界。
+
+请求结束时：
 
 ```text
-request A logical blocks:
-  logical 0 -> physical block 100
-  logical 1 -> physical block 37
-  logical 2 -> physical block 203
+移除 request -> blocks 映射
+按反向顺序降低 blocks 的 ref_cnt
+ref_cnt 变为 0 的 block 回到 free queue
+完整 block 的 hash 可继续保留
+真正重新分配该 block 时才执行 eviction/覆盖
 ```
 
-这和操作系统分页非常像：
+一个 full block 的典型生命周期是：
 
 ```text
-虚拟地址连续，不要求物理页连续。
+ free, no hash
+      │ allocate
+      ▼
+ active, ref_cnt=1 ── block 写满 ──> active + cached hash
+      │ request finish                         │ prefix hit
+      ▼                                        ▼
+ free queue, ref_cnt=0, hash 保留 <────── shared, ref_cnt>0
+      │
+      ├── 再次命中：touch，移出 free queue
+      └── 容量需要：evict hash，重新分配并覆盖
 ```
 
-vLLM 通过 block table 建立逻辑 block 到物理 block 的映射。
+反向释放使请求尾部、复用概率通常更低的 blocks 更早进入可驱逐位置。
 
-## 4. Block Manager 管哪些数据？
+## 6. 为什么 APC 主线不是 Copy-on-Write？
 
-可以先用一个简化模型理解：
+v0.25.0 V1 APC 共享的是已经计算完成的 full prefix blocks。新请求拥有不同后缀时，会为后缀分配新 blocks，而不是回头修改共享前缀。
 
 ```text
-FreeBlockList：当前空闲物理 block
-BlockTable：每个请求的逻辑 block -> 物理 block 映射
-RefCount：物理 block 被多少请求引用
-ComputedFlag：某个 block 是否已经计算完成，可用于 prefix cache
+request A: [shared full block 0][new block A]
+request B: [shared full block 0][new block B]
 ```
 
-真实实现会有更多细节，但主干就是这些。
-
-## 5. 分配：什么时候需要新 block？
-
-请求进入 prefill 时，需要根据 prompt 长度分配 KV block。
-
-例如：
+因此不应把当前 APC 实现描述为：
 
 ```text
-block_size = 16
-prompt_len = 40
-需要 block 数 = ceil(40 / 16) = 3
+ref_cnt > 1 时修改共享页 -> 拷贝旧页 -> 写新页
 ```
 
-decode 阶段也可能需要新 block。
+PagedAttention 原论文讨论过 parallel sampling/beam search 的共享与写时复制，这是重要历史设计，但不是解释 v0.25.0 V1 APC 的准确主线。当前应重点理解 hash、ref count、free queue、touch、eviction 和 append-only request block table。
 
-例如当前请求已经生成到第 16、32、48 个 token 的边界时，需要追加一个新 block。
+## 7. 分配到重复 hash 的 block 怎么办？
 
-简化伪代码：
+并发请求可能各自计算出内容相同的完整 block。V1 的请求 block table 是 append-only：已经给某请求追加的新 block 不会为了去重而替换成另一物理 block。因此同一 hash 可能暂时对应多个 block IDs。
 
-```cpp
-int NeedBlocks(int num_tokens, int block_size) {
-    return (num_tokens + block_size - 1) / block_size;
-}
+这不是 COW。它是并发计算与 append-only block table 下允许的重复缓存；请求释放后，冗余 block 会自然回到 pool。
 
-bool Allocate(Request& req, int new_tokens) {
-    int need = CalcAdditionalBlocks(req, new_tokens);
-    if (free_blocks.size() < need) {
-        return false;
-    }
+## 8. KV 不足与 preemption
 
-    for (int i = 0; i < need; ++i) {
-        auto block = free_blocks.pop();
-        req.block_table.push_back(block);
-    }
-    return true;
-}
-```
-
-这个伪代码不是 vLLM 源码，只是帮助你建立模型。
-
-## 6. 回收：请求结束后发生什么？
-
-当请求完成、取消或超时时，它占用的 KV block 可以释放。
+运行中请求继续增长时，需要新的 KV block。如果申请失败，Scheduler 可能抢占一个 running 请求：
 
 ```text
-request finished
-  -> 遍历 block table
-  -> ref count--
-  -> 如果 ref count == 0，放回 free list
+释放被抢占请求的 KV ownership
+num_computed_tokens = 0
+状态改为 PREEMPTED
+放回 waiting queue
+恢复后 recompute
 ```
 
-这里要注意共享场景。
+这说明 preemption 是容量压力信号，而不是免费的调度优化。需要同时观察 `vllm:kv_cache_usage_perc`、`vllm:num_preemptions`、waiting queue 和尾延迟。
 
-如果某个 block 被 prefix cache 或多个请求共享，不能直接释放物理 block，只能减少引用计数。
+## 9. 不要把所有模型都套进标准公式
+
+标准 decoder-only full attention 的基本容量公式很有用：
 
 ```text
-physical block 100 ref_count = 3
-释放 request A -> ref_count = 2，不能回收
-释放 request B -> ref_count = 1，不能回收
-释放 request C -> ref_count = 0，可以回收
+bytes/token/GPU
+  = 2(K,V)
+  × local_attention_layers
+  × local_kv_heads
+  × head_dim
+  × dtype_bytes
 ```
 
-## 7. 共享：为什么多个请求可以共用 KV？
+但 v0.25.0 还支持 MLA、sliding-window attention、Mamba、hybrid KV cache、不同 page size、KV quantization 和 KV connectors。真实容量应以启动时解析出的 KV cache specs 和日志为准。
 
-很多请求有共同前缀：
+## 10. 最小实验
+
+构造三次请求：
 
 ```text
-system prompt: 你是一个专业助手...
-工具说明: xxx
-few-shot 示例: xxx
-用户问题: ...
+R1 = 4096 token 固定前缀 + 问题 A
+R2 = 同一前缀 + 问题 B
+R3 = 只改前缀中间一个 token + 问题 C
 ```
 
-如果前缀完全一样，就没必要重复计算前缀 KV。
+记录：
 
-vLLM 可以让多个请求共享已经计算好的前缀 block：
+- 每次 `prompt_tokens_cached`；
+- R1 完成前后 KV Cache usage；
+- R2/R3 的 TTFT；
+- block size 对可命中 token 数的影响；
+- 使用不同 `cache_salt` 后是否还能复用。
 
-```text
-request A: [shared block 1][shared block 2][private block A]
-request B: [shared block 1][shared block 2][private block B]
-```
+验收目标是能解释“请求结束后 block 为什么既 free 又 cached”。
 
-这样可以节省：
+## 11. 源码核对入口
 
-1. GPU 计算：不用重复 prefill 前缀。
-2. GPU 显存：共享 KV block。
-3. TTFT：命中前缀缓存时首 token 更快。
+- `vllm/v1/core/kv_cache_utils.py`：`KVCacheBlock` 与 block hash。
+- `vllm/v1/core/block_pool.py`：free queue、touch、allocate、free、evict。
+- `vllm/v1/core/kv_cache_manager.py`：命中查询、slots 分配和释放入口。
+- `vllm/v1/core/kv_cache_coordinator.py`：不同 cache manager 的协调层。
+- `vllm/v1/core/single_type_kv_cache_manager.py`：请求 block table、cache full blocks。
+- `vllm/v1/core/sched/scheduler.py`：KV 申请失败后的等待和抢占。
+- `vllm/v1/kv_cache_interface.py`：KV cache spec 与 page 字节计算。
+- `vllm/v1/worker/block_table.py`：Worker 侧 block table 与 slot mapping。
 
-## 8. Copy-on-Write 是什么？
+## 12. 自检题
 
-共享 block 有一个问题：如果某个请求要继续往 block 里写数据怎么办？
-
-如果 block 被多个请求引用，直接写会影响其它请求。
-
-所以需要 Copy-on-Write：
-
-```text
-如果 block ref_count > 1，并且当前请求要修改它：
-  1. 分配一个新的物理 block
-  2. 拷贝旧 block 内容
-  3. 当前请求指向新 block
-  4. 旧 block ref_count--
-```
-
-这和操作系统 fork 后的写时复制很像。
-
-后端类比：
-
-```text
-多个玩家共享一份静态配置，没有问题。
-某个玩家要修改自己的副本时，必须 copy 一份私有数据。
-```
-
-## 9. 抢占：KV block 不够怎么办？
-
-高并发时，KV block 可能不够。
-
-这时 Scheduler 和 Block Manager 要协作处理。
-
-常见思路包括：
-
-1. 让新请求等待。
-2. 暂停某些运行中的请求。
-3. 释放某些请求的 KV block，后面重新计算。
-4. 根据策略选择牺牲哪个请求。
-
-这就是 preemption。
-
-可以理解为：
-
-```text
-当前显存资源不够，需要把某些请求从 running 状态踢回等待或重算状态。
-```
-
-它会带来代价：
-
-- 被抢占请求延迟上升。
-- 如果 KV 被释放，后面可能需要 recompute。
-- 系统吞吐和尾延迟都会受影响。
-
-所以抢占不是优化手段，而是资源不足时的保护机制。
-
-## 10. Block Manager 和 Scheduler 的关系
-
-Scheduler 想调度一个请求时，必须问资源管理器：
-
-```text
-这轮要处理这些 token，需要多少 KV block？
-现在够不够？
-```
-
-如果够：
-
-```text
-分配 block -> 加入本轮 batch -> Model Runner 执行
-```
-
-如果不够：
-
-```text
-等待 / 抢占 / 降低本轮调度量
-```
-
-所以 Scheduler 不是只按队列顺序调度，它必须受 KV Cache 容量约束。
-
-## 11. block size 有什么影响？
-
-block size 是 KV Cache 管理的关键粒度。
-
-如果 block size 太大：
-
-```text
-内部碎片增加。
-例如只多生成 1 个 token，也可能占用一个大 block。
-```
-
-如果 block size 太小：
-
-```text
-block table 更长，元数据更多，attention kernel 访问映射也更复杂。
-```
-
-所以 block size 是一个工程折中：
-
-```text
-显存利用率 vs 元数据/调度/kernel 复杂度
-```
-
-## 12. 读源码时看什么？
-
-读 Block Manager / KV Cache Manager 建议围绕这些问题：
-
-1. 物理 block 池在哪里初始化？
-2. 每个请求的 block table 如何维护？
-3. prefill 和 decode 分别什么时候追加 block？
-4. prefix cache 命中后如何复用已有 block？
-5. 请求结束、取消、抢占时如何释放？
-6. ref count 在哪里增加和减少？
-
-关键词可以先搜：
-
-```text
-kv_cache_manager
-block_manager
-block_table
-allocate
-free
-prefix_cache
-ref_cnt
-preempt
-```
-
-## 13. 和游戏后端内存池的类比
-
-你可以把 KV block 看成对象池里的固定大小对象。
-
-```text
-对象池：
-  预先分配 N 个对象，业务按需申请/释放。
-
-KV block 池：
-  预先占用一部分 GPU 显存切成 N 个 block，请求按需申请/释放。
-```
-
-区别是：
-
-1. KV block 在 GPU 显存上。
-2. KV block 会被 attention kernel 直接读取。
-3. block table 会进入模型执行路径。
-4. block 分配策略会直接影响吞吐和尾延迟。
-
-所以它既是内存管理问题，也是推理性能问题。
-
-## 14. 本文小结
-
-Block Manager 是 vLLM 能高效服务长上下文和高并发请求的关键。
-
-你需要记住：
-
-1. KV Cache 是在线推理的核心显存资源。
-2. vLLM 用固定大小 block 管理 KV Cache。
-3. block table 让逻辑 token 连续、物理显存不连续成为可能。
-4. ref count 和 Copy-on-Write 支持共享和安全修改。
-5. KV block 不够时会影响 Scheduler，甚至触发抢占。
-
-如果 Scheduler 解决的是“下一轮跑谁”，那 Block Manager 解决的是：
-
-```text
-这些请求有没有足够显存资源可以跑？
-```
+1. GPU KV tensor pool 与 CPU `BlockPool` 分别保存什么？
+2. 为什么 `ref_cnt=0` 的 cached block 仍可命中？
+3. APC 为什么只复用完整 blocks？
+4. 为什么 v0.25.0 APC 不需要把共享后缀解释成 COW？
+5. preemption 后为何把 `num_computed_tokens` 重置为 0？
 
 ## 参考资料
 
-- PagedAttention 论文：https://arxiv.org/abs/2309.06180
-- vLLM 官方文档：https://docs.vllm.ai/
-- vLLM Paged Attention 设计文档：https://docs.vllm.ai/en/latest/design/paged_attention.html
-- vLLM Automatic Prefix Caching：https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html
+- [vLLM v0.25.0 Prefix Caching Design](https://docs.vllm.ai/en/v0.25.0/design/prefix_caching/)
+- [vLLM v0.25.0 Automatic Prefix Caching](https://docs.vllm.ai/en/v0.25.0/features/automatic_prefix_caching/)
+- [vLLM v0.25.0 Optimization and Tuning](https://docs.vllm.ai/en/v0.25.0/configuration/optimization/)
+- [PagedAttention 论文](https://arxiv.org/abs/2309.06180)

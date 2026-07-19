@@ -1,389 +1,213 @@
-# 06｜Scheduler：continuous batching、prefill/decode 混排、chunked prefill
+# 06｜Scheduler：v0.25.0 的 continuous batching 与 chunked prefill
 
-这篇开始进入第二阶段：深入 vLLM 的关键模块。
+> 版本基线：vLLM v0.25.0，源码 commit `702f4814fe54fabff350d43cb753ae3e47c0c276`。本文讨论 V1 Engine 的默认 Scheduler；具体默认值仍会根据模型、设备和 usage context 解析，实验时必须保存最终启动日志。
 
-如果只用一句话概括 Scheduler：
+## 1. 先给结论
 
-```text
-Scheduler 决定下一轮 GPU forward 跑哪些请求、每个请求跑多少 token、需要多少 KV block，以及是否要等待、抢占或释放资源。
-```
-
-对后端开发来说，它不是一个简单队列，而是一个“带资源约束的实时调度器”。
-
-## 1. 为什么 LLM Serving 必须有 Scheduler？
-
-普通 HTTP 服务里，请求通常是：
+v0.25.0 的 Scheduler 不是“prefill 队列加 decode 队列”，而是一个统一的、受三类预算约束的 token 调度器：
 
 ```text
-request -> handler -> response
+请求状态：waiting / running
+计算预算：由 max_num_batched_tokens 解析出的有效 token budget
+序列预算：max_num_seqs
+显存预算：KV Cache 可分配 blocks
 ```
 
-但是 LLM 生成不是一次算完：
+对每个请求，Scheduler 关心的核心差值是：
 
 ```text
-request
-  -> prefill prompt
-  -> decode token 1
-  -> decode token 2
-  -> decode token 3
-  -> ...
+本轮仍需计算的 token
+  = request.num_tokens_with_spec
+  - request.num_computed_tokens
 ```
 
-一次请求会跨很多轮 GPU forward。
+这个差值可以表示首次 prefill、chunked prefill、普通 decode，也可以包含 speculative tokens。prefill/decode 是不同执行形态，但不是两套永久隔离的引擎。
 
-如果没有调度器，最直接的写法是：
+## 2. 一轮 `schedule()` 做什么？
+
+`vllm/v1/core/sched/scheduler.py:Scheduler.schedule()` 的主线可以压缩成：
 
 ```text
-来一个请求 -> 单独跑完整个生成 -> 返回
+1. 建立本轮 token budget 和 encoder budget
+2. 先尝试调度 running 请求
+3. 为请求计算 num_new_tokens，并受 token budget 限制
+4. 申请本轮需要的 KV slots
+5. slots 不足时，必要情况下抢占较低优先级请求
+6. 再尝试从 waiting 队列准入新请求
+7. 对新请求查询 prefix cache 命中并申请 blocks
+8. 生成 SchedulerOutput 交给 Model Executor
 ```
 
-这样 GPU 利用率会很差。因为 decode 阶段每次只生成一个 token，单请求 batch 太小，GPU 很容易吃不满。
-
-所以 vLLM 需要把很多请求合并起来，让每一轮 GPU forward 都尽量有足够工作量。
-
-## 2. 传统 batching 的问题
-
-传统静态 batch 可以理解为：
+从请求状态看，一轮调度可以画成：
 
 ```text
-收集一批请求
-  -> 一起 prefill
-  -> 一起 decode
-  -> 等全部结束
-  -> 再收下一批
+  新请求 ──> WAITING ── KV 足够、预算允许 ──> RUNNING
+                ▲                              │
+                │                              ▼
+                │                     schedule → execute → update
+                │                              │
+                │                 ┌────────────┴───────────┐
+                │                 │                        │
+                │              未完成                    已完成
+                │                 │                        │
+                │                 └──> RUNNING          FINISHED
+                │
+                └── PREEMPTED <── KV 不足，释放 ownership ── RUNNING
+
+  每一轮的三道门：token budget → sequence budget → KV block budget
 ```
 
-问题是 LLM 请求长度差异非常大：
+默认 FCFS 策略下，running 请求通常是正在 decode 或继续 chunked prefill 的请求。先处理 running 请求会自然保护正在生成的流，但源码仍以统一的 token 差值和预算组织它们。
 
-```text
-A：prompt 100 token，输出 50 token
-B：prompt 3000 token，输出 100 token
-C：prompt 200 token，输出 2000 token
-```
+`--scheduling-policy` 还支持 priority。使用 priority 时必须同时考虑优先级和到达时间，不能把它理解成业务层完整的租户公平性方案。
 
-静态 batch 会出现几个浪费：
+## 3. 三种预算不要混淆
 
-1. 短请求早就结束了，但 batch slot 被长请求拖住。
-2. 新请求来了，只能等当前 batch 完成。
-3. 长 prompt 请求会阻塞 decode 请求，导致正在流式输出的用户卡顿。
-4. batch 内部 token 数差异大，GPU 计算形态不稳定。
+### 3.1 Token budget
 
-这就是为什么 vLLM 使用 continuous batching。
-
-## 3. continuous batching 是什么？
-
-continuous batching 可以理解为“动态 batch”：
-
-```text
-每一轮调度：
-  1. 把已经完成的请求移出 batch
-  2. 把新来的请求加入 batch
-  3. 给每个请求分配本轮要处理的 token
-  4. 组成一次 GPU forward
-```
-
-它不是“攒够 N 个请求再跑”，而是持续维护一个正在执行的请求集合。
-
-简化图：
-
-```text
-step 1: A B C      -> GPU forward
-step 2: A B C D    -> D 加入
-step 3: B C D      -> A 完成
-step 4: B C D E F  -> E/F 加入
-```
-
-后端类比：
-
-```text
-游戏服务器 tick：
-  每一帧从各种队列里拿任务，根据预算执行一部分。
-
-vLLM Scheduler：
-  每一轮从 waiting/running 队列里拿请求，根据 token budget 和 KV block 预算执行一部分。
-```
-
-## 4. Scheduler 管什么资源？
-
-Scheduler 至少要管三类资源。
-
-### 4.1 请求状态
-
-一个请求通常会经历：
-
-```text
-waiting -> running -> finished
-           |
-           v
-        preempted / waiting for resource
-```
-
-不同阶段需要的资源不同：
-
-- prefill：处理 prompt，通常一次处理很多输入 token。
-- decode：每轮生成少量 token，通常每个序列一个 token。
-- finished：释放 KV block、返回最终结果。
-
-### 4.2 token budget
-
-一次 GPU forward 不能无限大。
-
-`max_num_batched_tokens` 可以粗略理解为：
-
-```text
-本轮最多处理多少 token
-```
-
-如果 budget 很大：
-
-- prefill-heavy 场景吞吐可能更好。
-- 单轮 GPU forward 变重。
-- decode 请求可能等更久。
-
-如果 budget 很小：
-
-- 单轮耗时更短。
-- 流式输出可能更平滑。
-- 整体吞吐可能下降。
-
-### 4.3 KV Cache block
-
-每个请求处理 token 时，都需要 KV Cache。
-
-prefill 会批量写入很多 KV；decode 每生成一个 token，也会追加新的 KV。
-
-Scheduler 在决定是否调度某个请求前，需要判断：
-
-```text
-这轮要处理的 token 是否有足够 KV block 可用？
-```
-
-如果没有，就要等待、抢占，或者让其它请求先跑。
-
-## 5. prefill 和 decode 的差异
-
-vLLM Scheduler 的难点之一是：prefill 和 decode 的计算形态不同。
-
-### 5.1 prefill
-
-prefill 处理 prompt：
-
-```text
-输入：一大段 prompt token
-输出：第一阶段 KV Cache + 可能的第一个 token
-```
-
-特点：
-
-- token 数可能很多。
-- 更像大矩阵计算。
-- 主要影响 TTFT，也就是首 token 延迟。
-
-### 5.2 decode
-
-decode 逐 token 生成：
-
-```text
-输入：上一个 token + 历史 KV Cache
-输出：下一个 token + 追加 KV Cache
-```
-
-特点：
-
-- 每个请求每轮通常只处理少量 token。
-- 会反复读取历史 KV Cache。
-- 主要影响 TPOT，也就是每个输出 token 的间隔。
-
-### 5.3 混排的矛盾
-
-如果只顾 prefill：
-
-```text
-新请求 TTFT 可能好，但老请求流式输出会卡。
-```
-
-如果只顾 decode：
-
-```text
-老请求输出很平滑，但新请求一直排队，TTFT 变差。
-```
-
-所以 Scheduler 要在两者之间做权衡。
-
-## 6. chunked prefill 解决什么问题？
-
-假设来了一个超长 prompt：
-
-```text
-prompt = 12000 tokens
-```
-
-如果一次性 prefill，它可能占满本轮 token budget，导致其它 decode 请求无法及时执行。
-
-chunked prefill 的思路是：
-
-```text
-不要一次性处理完整 prompt，而是切成多个 chunk。
-
-12000 tokens
-  -> chunk 1: 2048
-  -> chunk 2: 2048
-  -> chunk 3: 2048
-  -> ...
-```
-
-这样 Scheduler 可以把长 prefill 拆开，插入到多个调度轮次中。
-
-简化示意：
-
-```text
-round 1: decode A/B/C + prefill D chunk 1
-round 2: decode A/B/C + prefill D chunk 2
-round 3: decode A/B/C + prefill D chunk 3
-```
-
-它的核心价值：
-
-1. 避免长 prompt 独占 GPU。
-2. 降低 decode 请求的排队抖动。
-3. 让 TTFT 和 TPOT 之间更容易折中。
-
-## 7. 从队列视角理解 Scheduler
-
-可以把 Scheduler 简化成几个队列：
-
-```text
-waiting_queue：新请求，尚未开始 prefill
-running_queue：已经有 KV Cache，正在 decode 或继续 prefill
-finished_queue：已经结束，等待回收资源和返回
-```
-
-每一轮调度大致做这些事：
-
-```text
-while token_budget 还有剩余:
-    优先选择一部分 running 请求做 decode
-    再选择 waiting 请求做 prefill
-    如果 prompt 太长，就只处理一个 chunk
-    检查 KV block 是否足够
-    生成本轮要执行的 schedule
-```
-
-注意：真实 vLLM 的实现比这个复杂得多，比如多模态、LoRA、spec decode、prefix cache、分布式部署都会影响调度。但先用这个模型理解是足够的。
-
-## 8. 和游戏服务器 tick 的类比
-
-你可以把一次 GPU forward 理解成一帧 tick。
-
-```text
-游戏服务器 tick：
-  固定时间预算内处理玩家输入、AI、定时器、网络包。
-
-vLLM scheduler step：
-  固定 token / seq / KV block 预算内处理 prefill、decode、释放和抢占。
-```
-
-两者都要面对：
-
-- 队列积压。
-- 长任务阻塞短任务。
-- 资源预算不足。
-- 吞吐和延迟的权衡。
-- 公平性和优先级。
-
-所以你以前做游戏后端的经验不是没用，而是可以迁移到 LLM Serving 的调度问题上。
-
-## 9. 常见调优参数怎么影响 Scheduler？
-
-### 9.1 `--max-num-batched-tokens`
-
-控制单轮 token budget。
+`--max-num-batched-tokens` 是用户可见的批次 token 上限。Scheduler 实际使用内部 `max_num_scheduled_tokens` 作为本轮 budget；它通常等于前者，但在 async/speculative 等配置下可能为输出 placeholders 预留空间而更小。它约束的是本轮计算形状，不是 KV Cache 总容量，也不是 HTTP 总并发。
 
 ```bash
 vllm serve <model> --max-num-batched-tokens 8192
 ```
 
-直觉：
+调大后，一轮可能容纳更多 prefill token 或更多请求，吞吐可能上升；但更重的混合 batch 也可能影响 decode ITL。结论必须通过 workload 验证。
 
-```text
-更大 -> 单轮能塞更多 token，吞吐可能更高
-更小 -> 单轮更轻，延迟可能更稳定
-```
+### 3.2 Sequence budget
 
-### 9.2 `--max-num-seqs`
-
-控制单轮最多并发序列数。
+`--max-num-seqs` 限制一轮中最多有多少运行序列：
 
 ```bash
 vllm serve <model> --max-num-seqs 128
 ```
 
-直觉：
+它不是业务侧的连接数限制。超过本轮运行容量的请求仍可能留在 Engine waiting queue，API 层也可能已经接收更多连接。
+
+### 3.3 KV block budget
+
+Scheduler 在 `allocate_slots()` 返回 `None` 时知道 KV 空间不足。对 waiting 请求，通常是不准入；对已经 running 的请求，可能需要抢占其他 running 请求后重试。
+
+所以即使 token budget 还有剩余，也不代表请求一定能执行：
 
 ```text
-更大 -> 并发潜力更高，但 KV Cache 压力更大
-更小 -> 更保守，尾延迟可能更可控
+有计算预算 + 没有 KV blocks = 仍然不能 schedule
 ```
 
-### 9.3 `--enable-chunked-prefill`
+## 4. v0.25.0 的 chunked prefill
 
-用于控制是否启用 chunked prefill。
+V1 中，只要模型和功能组合支持，chunked prefill 默认启用。`EngineArgs._set_default_chunked_prefill_and_prefix_caching_args()` 会根据模型能力解析最终配置，不能只背 `SchedulerConfig` 类里的字段默认值。
 
-直觉：
+开启后，长 prompt 可以被拆到多轮 token budget 中：
 
 ```text
-长 prompt 场景下，它可以减少长 prefill 对 decode 的阻塞。
+prompt 12000 tokens, max_num_batched_tokens 4096
+
+step 1: prefill 4096
+step 2: decode requests + next prefill chunk
+step 3: decode requests + remaining prefill
 ```
 
-具体默认行为和参数细节要以当前 vLLM 版本文档为准，因为 vLLM V1 仍在持续演进。
+它的主要价值是让长 prefill 不必独占一整轮，同时允许 compute-heavy prefill 与 memory-heavy decode 混排。
 
-## 10. 读源码时看什么？
+可显式控制：
 
-读 Scheduler 不要一上来陷进所有分支。
+```bash
+vllm serve <model> --enable-chunked-prefill
+vllm serve <model> --no-enable-chunked-prefill
+```
 
-建议先抓住 5 个问题：
+调优方向不是固定单调关系：
 
-1. 请求如何从 waiting 进入 running？
-2. 每轮 token budget 如何扣减？
-3. prefill 和 decode 如何混排？
-4. KV block 分配失败时怎么办？
-5. 请求完成后资源在哪里释放？
+- 较小 token budget 往往更保护 decode ITL，但可能增加长 prompt 的完成轮数。
+- 较大 token budget 往往改善 prefill 效率和 TTFT，但可能形成更重的混合 batch。
+- 关闭 chunked prefill 时，`max_num_batched_tokens` 必须足以容纳允许的长请求；不要沿用开启时的小预算配置。
 
-源码阅读路径可以先围绕这些关键词：
+## 5. 抢占在 v0.25.0 中意味着什么？
+
+当 running 请求需要新 KV slots、但 block 不足时，默认 Scheduler 可以抢占请求：
 
 ```text
-scheduler
-schedule
-waiting
-running
-num_batched_tokens
-num_seqs
-block_manager / kv_cache_manager
+running -> PREEMPTED -> waiting
 ```
 
-不要把 Scheduler 当成一个孤立模块。它一定会和 KV Cache Manager、Model Runner、Output Processor 联动。
+`_preempt_request()` 会释放该请求持有的 KV blocks，把 `num_computed_tokens` 重置为 0，并把请求放回 waiting queue。恢复时需要重新计算，因此 v0.25.0 V1 的核心代价是 recomputation，而不是免费的暂停/恢复。
 
-## 11. 本文小结
+频繁 preemption 通常说明容量或准入配置失衡。优先检查：
 
-Scheduler 是 vLLM 的“资源调度中枢”。
+- KV Cache 总容量和 `gpu_memory_utilization`；
+- `max_num_seqs` 是否过大；
+- 输入/输出长度是否失控；
+- 外层 arrival rate 是否已经超过服务能力；
+- TP/PP 改变后权重和通信成本是否值得。
 
-它解决的不是“怎么调用模型”这么简单，而是：
+## 6. 默认 async scheduling 怎样改变观察方式？
+
+v0.25.0 在配置兼容时默认启用 async scheduling。Engine Core 会通过 batch queue 让多个 batch in flight，重叠 CPU scheduling/input preparation 与 GPU execution。
+
+逻辑依赖仍是：
 
 ```text
-在有限 GPU 显存、有限 token budget、动态请求长度下，如何让 GPU 尽量忙，同时让用户延迟可接受。
+schedule(batch N)
+  -> execute(batch N)
+  -> update(batch N)
 ```
 
-你需要重点记住：
+但时间线上可能看到：
 
-1. continuous batching 让请求可以动态进出 batch。
-2. prefill 主要影响 TTFT，decode 主要影响 TPOT。
-3. chunked prefill 把长 prompt 拆开，避免阻塞 decode。
-4. Scheduler 的每个决策都受 KV Cache block 约束。
-5. 学 vLLM 调度，本质是在学高性能服务端资源调度。
+```text
+GPU execute N
+与 CPU schedule / prepare N+1 重叠
+```
+
+为了第一次读源码，可以先用同步基线：
+
+```bash
+vllm serve <model> --no-async-scheduling
+```
+
+理解后再去掉该参数，比较默认路径。不要把同步教学路径误认为 v0.25.0 的默认运行时。
+
+## 7. 最小实验
+
+准备两个请求：
+
+```text
+A: prompt 128，output 256，先到达
+B: prompt 8192，output 16，稍后到达
+```
+
+分别使用两组 `max_num_batched_tokens`，其他条件不变，记录：
+
+- A 的 ITL P50/P99；
+- B 的 TTFT；
+- 每轮 scheduled tokens；
+- waiting/running 数量；
+- KV Cache 使用率与 preemption；
+- GPU 时间线是否出现空洞。
+
+验收不是“哪组更快”，而是能根据每轮 token 组成解释 A、B 指标为什么变化。
+
+## 8. 源码核对入口
+
+- `vllm/v1/core/sched/scheduler.py`：`schedule()`、`_preempt_request()`、waiting/running。
+- `vllm/v1/core/sched/output.py`：`SchedulerOutput`。
+- `vllm/v1/core/sched/async_scheduler.py`：异步调度下的状态更新。
+- `vllm/v1/core/kv_cache_manager.py`：`get_computed_blocks()`、`allocate_slots()`。
+- `vllm/config/scheduler.py`：Scheduler 配置结构和约束。
+- `vllm/engine/arg_utils.py`：模型/设备相关默认值的最终解析。
+- `vllm/config/vllm.py`：有效 scheduled-token budget、async scheduling 的兼容性与默认开启逻辑。
+- `vllm/v1/engine/core.py`：同步 step 与 batch queue 路径。
+
+## 9. 自检题
+
+1. 为什么 `max_num_batched_tokens` 有余量时，请求仍可能无法运行？
+2. chunked prefill 为什么可能改善 decode ITL？
+3. v0.25.0 为什么不能简单描述成两个独立的 prefill/decode 队列？
+4. preemption 后为什么需要 recompute？
+5. async scheduling 改变了哪个时间关系，又没有改变哪个逻辑依赖？
 
 ## 参考资料
 
-- vLLM 官方文档：https://docs.vllm.ai/
-- vLLM V1 文档：https://docs.vllm.ai/en/latest/usage/v1_guide.html
-- vLLM Engine Arguments：https://docs.vllm.ai/en/latest/configuration/engine_args.html
-- PagedAttention 论文：https://arxiv.org/abs/2309.06180
+- [vLLM v0.25.0 Optimization and Tuning](https://docs.vllm.ai/en/v0.25.0/configuration/optimization/)
+- [vLLM v0.25.0 Engine Arguments](https://docs.vllm.ai/en/v0.25.0/configuration/engine_args/)
+- [vLLM v0.25.0 Architecture Overview](https://docs.vllm.ai/en/v0.25.0/design/arch_overview/)

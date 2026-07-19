@@ -1,418 +1,227 @@
-# 08｜Model Runner：一次 forward 前后到底发生了什么
+# 08｜Model Runner：v0.25.0 一次 forward 前后发生什么
 
-前两篇讲了 Scheduler 和 KV block。这一篇进入执行层：Model Runner。
+> 版本基线：vLLM v0.25.0，源码 commit `702f4814fe54fabff350d43cb753ae3e47c0c276`。v0.25.0 同时存在 Model Runner V1 与 V2；本文先说明共同职责，再明确两条实现路径，避免把 V1 数据结构当成所有默认配置的唯一实现。
 
-一句话概括：
+## 1. Model Runner 的职责
 
-```text
-Model Runner 负责把 Scheduler 选出来的一批请求，整理成模型可以执行的输入，在 GPU 上完成 forward，并把 logits / hidden states / KV Cache 更新等结果交回上层。
-```
+Scheduler 输出的是“本轮跑哪些请求、每个请求跑多少 token、使用哪些 KV blocks”。模型不能直接消费这份高层调度结果。
 
-如果 Scheduler 是“决定跑什么”，Block Manager 是“保证资源够不够”，Model Runner 就是“真正把这一轮跑起来”。
-
-## 1. 不要把 forward 理解得太简单
-
-很多人刚开始会以为 forward 就是：
-
-```python
-outputs = model(input_ids)
-```
-
-但在 vLLM 这种推理引擎里，一次 forward 前后要做很多工程准备。
-
-因为输入不是一个普通 tensor，而是一批状态不同的请求：
+Model Runner 负责把它变成设备可执行的批次：
 
 ```text
-request A：decode，当前只要生成 1 个 token
-request B：decode，当前只要生成 1 个 token
-request C：prefill，当前要处理 512 个 prompt token
-request D：chunked prefill，当前处理第 2 个 chunk
+SchedulerOutput
+  -> 更新持久请求状态
+  -> 组织 input_ids / positions
+  -> 更新 block table 与 attention metadata
+  -> 选择/填充采样参数
+  -> model forward
+  -> logits / sampler
+  -> ModelRunnerOutput
 ```
 
-Model Runner 需要把这些请求整理成一个 GPU 友好的 batch。
+所以 vLLM 的一次 forward 不只是 `model(input_ids)`，而是服务状态到 tensor 状态的转换层。
 
-## 2. 一次推理 step 的大致链路
-
-可以先看一条简化链路：
+一次执行的主数据流：
 
 ```text
-API / Engine
-  -> Scheduler 生成 schedule
-  -> KV Cache Manager 分配 block
-  -> Model Runner 准备输入
-  -> Attention Backend 读取/写入 KV Cache
-  -> Model forward
-  -> Sampler 采样下一个 token
-  -> Output Processor 处理输出
-  -> 请求状态更新，进入下一轮
+SchedulerOutput
+      │ requests / scheduled tokens / block IDs
+      ▼
+┌──────────────────── Model Runner ────────────────────┐
+│ 更新 persistent request state                       │
+│      ▼                                               │
+│ input_ids + positions + sampling tensors             │
+│      │                 block table / slot mapping ────┼──┐
+└──────┼───────────────────────────────────────────────┘  │
+       ▼                                                  ▼
+  Model Layers ─────────── read/write ─────────────> GPU KV Pool
+       │
+       ▼
+    logits ──> sampler ──> ModelRunnerOutput
+                              │ new token IDs
+                              ▼
+                  Scheduler.update_from_output()
 ```
 
-Model Runner 位于中间执行层。
+## 2. v0.25.0 有两套 GPU Model Runner
 
-它既要懂模型输入，又要懂 vLLM 的调度元数据。
+### 2.1 Model Runner V1
 
-## 3. forward 前：准备哪些输入？
-
-一次 forward 前，通常要准备这些东西。
-
-### 3.1 token ids
-
-也就是本轮要送进模型的 token。
-
-prefill 请求可能有很多 token：
+主文件：
 
 ```text
-[101, 2054, 2003, ...]
+vllm/v1/worker/gpu_model_runner.py
 ```
 
-decode 请求通常只有一个 token：
+它使用 V1 persistent batch、`CachedRequestState`、Worker 侧 `BlockTable` 等结构。仓库的交互源码导览固定 `VLLM_USE_V2_MODEL_RUNNER=0`，主要展示这一条路径。
+
+### 2.2 Model Runner V2
+
+主目录：
 
 ```text
-[上一次生成的 token]
+vllm/v1/worker/gpu/
+  model_runner.py
+  input_batch.py
 ```
 
-Scheduler 决定本轮每个请求处理多少 token，Model Runner 负责把它们拼成 batch 输入。
+v0.25.0 对多数受支持的非 MoE 生成模型默认选择 V2；不支持的模型或功能会回退 V1。最终选择由 `VllmConfig.use_v2_model_runner` 及兼容性检查决定，而不是只看文件名。
 
-### 3.2 positions
+V2 的关键变化包括：
 
-Transformer 需要知道每个 token 的位置。
+- 每个活跃请求获得稳定的 persistent-state row；
+- persistent state 与每步真正的模型输入解耦；
+- 通过 staged writes 增量更新大 tensor；
+- 从设计上以 async-first、避免 CPU/GPU 同步为目标。
+
+不能把 V1 的 `CachedRequestState`、行交换和输入准备细节直接套到 V2。
+
+## 3. 两条路径的共同输入
+
+无论 V1/V2，Model Runner 都需要回答以下问题：
+
+### 3.1 本轮有哪些 token？
+
+Scheduler 为每个请求提供 `num_scheduled_tokens`。Runner 根据请求已有 token 状态取出本轮需要计算的 token IDs，并拼成连续批次。
 
 ```text
-request A 已经有 128 个历史 token，本轮 decode token 的 position = 128
-request B 已经有 2048 个历史 token，本轮 position = 2048
+request A: positions 128..128
+request B: positions 512..767
+
+flattened input:
+[A decode token][B prefill chunk 256 tokens]
 ```
 
-position 影响 RoPE / positional embedding。
+因此同一批次可以同时包含单 token decode 和多 token prefill chunk。
 
-如果 position 错了，模型输出就会错。
+### 3.2 每个 token 的 position 是什么？
 
-### 3.3 slot mapping
+position 表示 token 在其请求序列中的逻辑位置，不是它在本轮扁平 batch 中的下标。位置相关编码和 attention mask 都依赖它。
 
-slot mapping 可以粗略理解为：
+### 3.3 历史 KV 在哪里？
+
+Scheduler 分配 block IDs；Runner 把它们写入每请求的 block table。attention backend 通过 block table 把逻辑历史位置映射到物理 KV pages。
+
+### 3.4 新 K/V 写到哪里？
+
+对标准 paged attention 路径，可以把写地址理解为：
 
 ```text
-本轮每个 token 的 KV 应该写到哪个物理位置。
+slot = physical_block_id * block_size + offset_in_block
 ```
 
-因为 vLLM 的 KV Cache 是分页管理的，逻辑 token 位置和物理显存位置不是简单连续关系。
+V1 的 `BlockTable.compute_slot_mapping()` 直接体现这条关系。V2 的状态组织不同，但仍必须向 attention backend 提供等价的页表/写入元数据。MLA、hybrid KV、KV connector 等路径会扩展这一基本模型。
 
-所以 Model Runner 要把调度结果转换成 attention backend 能理解的映射信息。
+## 4. Prefill 与 decode 的 forward 形状
 
-### 3.4 block tables
+### Prefill / chunked prefill
 
-block table 描述每个请求的逻辑 block 到物理 block 映射。
+- 单请求本轮可能包含多个 token；
+- 需要为这些 token 批量产生 K/V；
+- 首次请求通常没有历史 prefix hit，命中 APC 时只计算未缓存后缀；
+- 主要影响 TTFT 和 input tokens/s。
 
-Attention kernel 读取历史 KV 时，需要知道：
+### Decode
 
-```text
-这个请求的第 0 个逻辑 block 在哪个 physical block？
-第 1 个逻辑 block 在哪里？
-第 2 个逻辑 block 在哪里？
+- 普通非投机路径通常每个请求计算一个新输入 token；
+- 会读取该请求的大量历史 K/V；
+- 新生成 token 的 KV 在下一轮把它作为输入时写入；
+- 主要影响 ITL/TPOT 和 output tokens/s。
+
+Speculative decoding 会让“decode 每请求严格一个 token”的描述失效：验证轮可能一次处理 `1 + num_speculative_tokens` 个位置。
+
+## 5. Model forward、logits 与 sampler
+
+Runner 在建立 forward context 后执行模型。每层 attention 读写 KV，最终 hidden states 进入 logits 计算和 sampler。
+
+采样不是全局固定行为。每个请求可能有不同的：
+
+- temperature、top-p、top-k、min-p；
+- repetition/presence/frequency penalty；
+- logprobs；
+- seed；
+- structured output 等约束。
+
+Runner 必须把请求级参数映射到正确的 batch row。输出至少要携带新 token IDs，以及 Scheduler/输出处理所需的附加信息。
+
+Engine Core 随后调用 Scheduler 的更新逻辑，推进 `num_computed_tokens`、处理 stop/finish，并释放完成请求的 KV ownership。
+
+## 6. Persistent batch 为什么重要？
+
+连续两轮的请求集合通常高度相似：大部分请求仍在 decode，只有少数加入或结束。如果每轮都用 Python 从零构造大型 block tables 和采样 tensor，CPU 准备开销可能限制 GPU。
+
+V1/V2 都利用 persistent state 做增量更新，但设计不同：
+
+- V1 把 persistent tensors 更直接地当作模型/采样输入，状态维护复杂。
+- V2 为请求分配稳定 row，再从 persistent state gather 每步输入，减少重排和异步竞争。
+
+学习时要先理解“为何持久化”，再分别看两套具体实现。
+
+## 7. Async scheduling 对 Runner 的要求
+
+默认 async scheduling 会让 CPU 准备 N+1 时 GPU 仍在执行 N。这要求：
+
+- 避免无意的 device synchronization；
+- 正确管理 pinned buffer 生命周期；
+- 防止 CPU 覆盖 GPU 尚未读取完的状态；
+- 正确处理 preemption/finish 与 in-flight batch 的状态关系。
+
+这也是 Model Runner V2 明确采用 async-first 设计的原因之一。
+
+## 8. CUDA Graph 在什么位置？
+
+Runner 会根据 compilation config、attention backend 能力和当前 batch descriptor 选择 eager、piecewise graph 或 full graph 路径。CUDA Graph 的作用是减少重复形状下的 Python/CUDA launch overhead，不会消除模型计算和 KV 读写本身。
+
+v0.25.0 默认 optimization level 是 O2，但实际 CUDA Graph 模式可能因 backend/模型能力降级。排障时可用 `--enforce-eager` 建立无 CUDA Graph 基线。
+
+## 9. 推荐的双路径实验
+
+### 9.1 同步 V1 教学基线
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=0 \
+vllm serve <model> \
+  --no-async-scheduling \
+  --enforce-eager
 ```
 
-block table 是 PagedAttention 能工作的关键元数据之一。
-
-### 3.5 sequence lengths
-
-Attention 需要知道每个序列当前长度。
-
-```text
-request A seq_len = 129
-request B seq_len = 2049
-request C seq_len = 512
-```
-
-不同请求长度不一样，kernel 需要用这些信息做正确的 causal attention。
-
-## 4. prefill 和 decode 在 Model Runner 里有什么不同？
-
-### 4.1 prefill 路径
-
-prefill 输入一段 prompt token。
-
-```text
-input: prompt tokens
-output: prompt 对应的 KV Cache + logits
-```
-
-它的重点是：
-
-1. 一次处理多个 token。
-2. 批量写入 KV Cache。
-3. 通常决定首 token 延迟。
-
-### 4.2 decode 路径
-
-decode 输入当前 token。
-
-```text
-input: last generated token
-output: next token logits + 追加一个 KV
-```
-
-它的重点是：
-
-1. 每个请求每轮通常一个 token。
-2. 需要读取完整历史 KV。
-3. 反复执行很多轮。
-
-### 4.3 混合 batch
-
-vLLM 的一轮 batch 可能同时包含 prefill 和 decode。
-
-所以 Model Runner 不能只处理一种固定形态，而要根据调度元数据组织输入。
-
-```text
-batch = [
-  decode A: 1 token,
-  decode B: 1 token,
-  prefill C: 256 tokens,
-  prefill D: 512 tokens,
-]
-```
-
-这就是为什么 vLLM 的执行层比普通模型 demo 复杂很多。
-
-## 5. forward 中：模型到底做什么？
-
-从 Transformer 视角看，forward 大致经过：
-
-```text
-input_ids
-  -> embedding
-  -> N 层 Transformer block
-       -> attention
-       -> MLP
-  -> lm_head
-  -> logits
-```
-
-vLLM 的特殊点主要在 attention。
-
-attention 需要：
-
-1. 把本轮 token 的 K/V 写入 KV Cache。
-2. 根据 block table 读取历史 K/V。
-3. 执行 causal attention。
-4. 输出 hidden states。
-
-所以 attention backend 是 Model Runner 调用链里非常关键的一层。
-
-## 6. forward 后：logits 还不能直接返回
-
-模型 forward 后得到的是 logits。
-
-```text
-logits: 每个 token 对整个词表的分数
-```
-
-但用户要的是文本 token。
-
-还需要 sampler：
-
-```text
-logits
-  -> temperature
-  -> top_p / top_k
-  -> repetition penalty
-  -> sampling / greedy
-  -> next token id
-```
-
-不同请求可能有不同 SamplingParams：
-
-```text
-request A: temperature = 0.7, top_p = 0.9
-request B: temperature = 0.0, greedy
-request C: max_tokens = 1024
-```
-
-所以采样也是请求级别的。
-
-## 7. 输出之后：请求状态如何更新？
-
-每轮生成后，要更新请求状态：
-
-```text
-append new token
-update seq len
-check stop tokens
-check max_tokens
-check eos
-update streaming output
-```
-
-如果请求结束：
-
-```text
-release KV blocks
-remove from running
-return final output
-```
-
-如果没结束：
-
-```text
-继续留在 running，等待下一轮调度
-```
-
-因此一次 forward 不是结束点，只是一轮循环的一部分。
-
-## 8. CUDA Graph 在这里起什么作用？
-
-CUDA Graph 可以减少 CPU launch overhead。
-
-普通执行大致是：
-
-```text
-Python / PyTorch 每次 forward 都发起一堆 CUDA kernel launch
-```
-
-如果每轮 decode 形态比较固定，就可以捕获成 CUDA Graph：
-
-```text
-capture 一段固定执行图
-后续 replay，减少 CPU 调度开销
-```
-
-但 CUDA Graph 对输入形状比较敏感。
-
-vLLM 需要在性能收益和动态 batch 灵活性之间做权衡。
-
-可以这样理解：
-
-```text
-动态调度越灵活，执行图越难固定。
-执行图越固定，CUDA Graph 越容易复用。
-```
-
-## 9. Model Runner 和 Worker 的关系
-
-在多 GPU / 多进程架构中，vLLM 会有 worker 进程。
-
-Worker 更像执行单元：
-
-```text
-Worker
-  -> 持有模型权重
-  -> 持有或访问 KV Cache
-  -> 调用 Model Runner 执行 forward
-```
-
-Model Runner 则更关注单次 forward 的准备和执行。
-
-你可以粗略理解为：
-
-```text
-Worker：进程级执行容器
-Model Runner：模型级执行逻辑
-Attention Backend：核心算子/内核实现
-```
-
-## 10. 从后端角度看 Model Runner
-
-后端开发可以把 Model Runner 类比为一个“协议适配 + 执行器”。
-
-上游 Scheduler 给的是调度结果：
-
-```text
-哪些请求、本轮多少 token、对应哪些 block
-```
-
-下游模型需要的是 tensor：
-
-```text
-input_ids
-positions
-block_tables
-slot_mapping
-seq_lens
-```
-
-Model Runner 做的事情就是：
-
-```text
-业务状态 -> 计算图输入
-计算图输出 -> 业务状态更新
-```
-
-这和游戏服务器里把玩家状态打包成战斗逻辑输入，再把战斗结果写回玩家状态很像。
-
-## 11. 常见性能瓶颈在哪里？
-
-### 11.1 CPU 侧准备太慢
-
-如果 batch 构造、元数据准备、进程通信太慢，GPU 会等 CPU。
-
-表现可能是：
-
-```text
-GPU utilization 不高，但请求延迟高
-```
-
-### 11.2 batch 形态不稳定
-
-动态 batch 长度变化大，会影响 kernel 选择、CUDA Graph 复用和整体吞吐。
-
-### 11.3 attention 读 KV 成本高
-
-长上下文 decode 时，每个新 token 都要读大量历史 KV。
-
-这会让 decode 更容易受 memory bandwidth 影响。
-
-### 11.4 采样和输出处理变成瓶颈
-
-高并发流式输出时，detokenizer、HTTP streaming、日志和 metrics 也可能成为瓶颈。
-
-不要只盯 GPU kernel。
-
-## 12. 读源码时看什么？
-
-建议围绕一次 forward 的输入输出读：
-
-1. Scheduler 输出了什么调度结构？
-2. Model Runner 如何构造 input_ids 和 positions？
-3. block tables 和 slot mapping 从哪里来？
-4. attention backend 如何拿到这些元数据？
-5. logits 如何进入 sampler？
-6. next token 如何写回 request state？
-
-关键词可以先搜：
-
-```text
-model_runner
-execute_model
-prepare_input
-input_batch
-sampling_metadata
-logits
-sampler
-```
-
-## 13. 本文小结
-
-Model Runner 是 vLLM 执行链路里的关键转换层。
-
-你需要记住：
-
-1. Scheduler 决定本轮跑哪些请求。
-2. Block Manager 决定 KV block 如何映射。
-3. Model Runner 把调度结果整理成模型输入。
-4. Attention Backend 根据 block table 读写 KV Cache。
-5. Sampler 把 logits 转成 next token。
-6. 请求状态更新后进入下一轮调度。
-
-不要把 vLLM 的 forward 理解成简单的 `model(input_ids)`。
-
-更准确的理解是：
-
-```text
-一次 forward 是调度、内存映射、模型执行、采样、状态更新共同组成的一轮服务端循环。
-```
+用单请求、`max_tokens=3`，记录每轮：
+
+- scheduled token 数；
+- input IDs 与 positions 的形状；
+- block table 新增项；
+- sampler 返回 token；
+- `num_computed_tokens` 更新。
+
+### 9.2 默认 v0.25.0 路径
+
+去掉三个教学限制重新启动。根据日志确认是否选择 V2、async scheduling 和何种 compilation/CUDA Graph 模式，再用 Nsight Systems 比较 CPU/GPU 重叠。
+
+验收目标不是只跑通，而是能指出两条路径“职责相同、数据结构和时间线不同”的位置。
+
+## 10. 源码核对入口
+
+- `vllm/v1/worker/gpu_worker.py`：Worker 初始化、runner 选择和执行入口。
+- `vllm/v1/worker/gpu_model_runner.py`：Model Runner V1。
+- `vllm/v1/worker/gpu/model_runner.py`：Model Runner V2。
+- `vllm/v1/worker/gpu/input_batch.py`：V2 persistent input state。
+- `vllm/v1/worker/block_table.py`：V1 block table 与 slot mapping。
+- `vllm/v1/attention/backend.py`：通用 attention metadata。
+- `vllm/v1/engine/core.py`：Executor 调用与输出回收。
+- `vllm/config/vllm.py`：V2 runner、async scheduling、优化级别解析。
+- `vllm/v1/cudagraph_dispatcher.py`：CUDA Graph runtime dispatch。
+
+## 11. 自检题
+
+1. SchedulerOutput 为什么不能直接传给 `model(input_ids)`？
+2. logical position 与 flattened batch index 有什么区别？
+3. block table 和 slot mapping 分别服务于哪类访问？
+4. V1/V2 persistent batch 的共同目标和主要差异是什么？
+5. 为什么 async scheduling 容易引入 buffer race？
 
 ## 参考资料
 
-- vLLM 官方文档：https://docs.vllm.ai/
-- vLLM 架构设计文档：https://docs.vllm.ai/en/latest/design/architecture.html
-- vLLM CUDA Graphs 设计文档：https://docs.vllm.ai/en/latest/design/cuda_graphs.html
-- vLLM GitHub：https://github.com/vllm-project/vllm
+- [vLLM v0.25.0 Model Runner V2 Design](https://docs.vllm.ai/en/v0.25.0/design/model_runner_v2/)
+- [vLLM v0.25.0 Architecture Overview](https://docs.vllm.ai/en/v0.25.0/design/arch_overview/)
+- [vLLM v0.25.0 CUDA Graphs](https://docs.vllm.ai/en/v0.25.0/design/cuda_graphs/)
+- [vLLM v0.25.0 Optimization and Tuning](https://docs.vllm.ai/en/v0.25.0/configuration/optimization/)

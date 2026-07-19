@@ -1,388 +1,318 @@
-# 11｜如何读 vLLM 源码：从请求生命周期切进去
+# 11｜如何读 vLLM v0.25.0 源码：追踪一条请求
 
-第三阶段开始，目标从“理解模块”转向“形成岗位能力”。
+> 版本基线：本机 `/Users/leeson/codes/vllm` 的 v0.25.0 tag，commit `702f4814fe54fabff350d43cb753ae3e47c0c276`。源码行号会随 commit 变化，因此笔记必须同时记录 commit、文件和 symbol。
 
-读 vLLM 源码不要一上来就全局搜索 CUDA kernel，也不要从模型结构开始。更建议从一条请求生命周期切进去：
+## 1. 先确定阅读场景
+
+第一次不要同时追多卡、MoE、spec decode、KV connector 和异步执行。建议使用：
 
 ```text
-HTTP 请求
-  -> Engine 接收
-  -> Scheduler 调度
-  -> KV Cache 分配
-  -> Model Runner 执行 forward
-  -> Sampler 生成 token
-  -> Output Processor 返回流式结果
+decoder-only generation
+单 GPU，TP=1，DP=1
+Model Runner V1
+同步调度
+无 speculative decoding
+本地 KV Cache
 ```
 
-这条链路读通，比零散看文件更有效。
+启动基线：
 
-## 1. 先明确读源码的目标
-
-读源码不是为了记住每个类名，而是为了回答几个工程问题：
-
-1. 请求从哪里进入？
-2. 请求状态在哪里保存？
-3. 一轮调度如何决定跑哪些请求？
-4. KV Cache block 如何分配和释放？
-5. forward 前准备了哪些 tensor 和元数据？
-6. logits 如何变成 next token？
-7. 流式输出如何返回给客户端？
-8. 发生 OOM、抢占、取消请求时如何处理？
-
-只要你能沿着这些问题读源码，就不会迷路。
-
-## 2. 不建议的读法
-
-### 2.1 从 CUDA kernel 开始
-
-不建议一上来读：
-
-```text
-csrc/
-attention kernel
-paged attention kernel
-custom op
+```bash
+VLLM_USE_V2_MODEL_RUNNER=0 \
+vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --no-async-scheduling \
+  --enforce-eager \
+  --generation-config vllm
 ```
 
-因为你还不知道这些 kernel 的输入从哪里来，也不知道 block table、slot mapping、seq lens 的业务含义。
+这不是 v0.25.0 默认性能配置，而是减少并发时间线、Runner 和 CUDA Graph 分支的教学配置。主链路读通后必须再对照默认 V2/async/O2 路径。
 
-先读 kernel 容易陷入：
+## 2. 要回答的八个问题
+
+每打开一个文件，只围绕：
+
+1. HTTP 请求在哪里变成模型输入？
+2. chat template 和 tokenization 在哪里发生？
+3. API 进程怎样把请求送到 Engine Core？
+4. waiting/running 状态保存在哪里？
+5. 一轮怎样分配 token budget 与 KV blocks？
+6. Worker 怎样得到 input IDs、positions、block table？
+7. 新 K/V 怎样写入、历史 K/V 怎样读取？
+8. token 怎样 detokenize、stop、stream 并最终释放资源？
+
+如果一段代码不能帮助回答这些问题，第一次可以跳过。
+
+先用这张图建立进程和回程方向：
 
 ```text
-每一行都像懂了，但不知道整体干什么。
+进程 A：API Server
+
+  HTTP / Chat Request
+          │
+          ▼
+  Router → Serving → AsyncLLM/InputProcessor
+          │ EngineCoreRequest
+          │ ZMQ ADD
+══════════╪══════════════════════════════════════════════
+          ▼
+进程 B：Engine Core
+
+  input socket → Request → Scheduler → Executor
+                                      │
+                                      ▼
+                          GPU Worker / Model Runner
+                                      │
+                         model output / token IDs
+                                      ▼
+  Scheduler update ← EngineCoreOutputs
+          │
+          │ ZMQ output
+══════════╪══════════════════════════════════════════════
+          ▼
+进程 A：OutputProcessor → detokenize/stop → JSON 或 SSE
+
+注：单 GPU UniProcExecutor 下，Worker 可与 Engine Core 同进程；
+    多卡 mp 通常会再启动独立 GPU Worker 进程。
 ```
 
-### 2.2 从所有配置参数开始
+## 3. v0.25.0 在线 Chat 请求主链路
 
-vLLM 参数非常多。如果一开始就背参数，会很碎。
-
-更好的方式是先按资源分类：
+### 3.1 HTTP 路由
 
 ```text
-显存：gpu_memory_utilization、max_model_len、kv_cache_dtype
-调度：max_num_batched_tokens、max_num_seqs、chunked prefill
-并行：tensor_parallel_size、pipeline_parallel_size、data_parallel_size
-优化：prefix caching、speculative decoding、quantization
+vllm/entrypoints/openai/chat_completion/api_router.py
+  -> create_chat_completion()
 ```
 
-参数要和模块一起看。
+这里接收 OpenAI Chat Completions 请求，取得 serving handler，并返回 JSON 或 SSE `StreamingResponse`。不要从巨大的 `api_server.py` 开始搜索所有路由；v0.25.0 已把各 API 拆到各自的 router/serving 模块。
 
-### 2.3 从模型结构开始
-
-模型结构当然重要，但 vLLM 的核心竞争力不是“实现了 Llama”，而是：
+### 3.2 Chat 渲染和参数转换
 
 ```text
-如何把很多请求高效调度到 GPU 上服务。
+vllm/entrypoints/openai/chat_completion/serving.py
+  -> _create_chat_completion()
 ```
 
-所以源码阅读优先级应该是 serving runtime，而不是模型定义本身。
+关注：
 
-## 3. 推荐阅读顺序
+- messages 怎样应用 chat template；
+- token IDs 怎样形成；
+- OpenAI 字段怎样转成 `SamplingParams`；
+- request ID 怎样生成；
+- `engine_client.generate()` 怎样被调用。
 
-推荐按下面顺序：
+### 3.3 AsyncLLM 与 InputProcessor
 
 ```text
-1. OpenAI-compatible API 入口
-2. Engine / request 生命周期
-3. Scheduler
-4. KV Cache Manager / Block Manager
-5. Model Runner
-6. Sampler / Output Processor
-7. Attention Backend
-8. 分布式、多卡、量化、spec decode
+vllm/v1/engine/async_llm.py
+  -> generate()
+  -> add_request()
+
+vllm/v1/engine/input_processor.py
+  -> process_inputs()
 ```
 
-这和前两阶段文章顺序一致。
+`InputProcessor` 产生可发送给 Engine Core 的 `EngineCoreRequest`。`AsyncLLM.generate()` 同时维护逐请求输出收集器；客户端取消或生成器结束时还要走 abort/清理路径。
 
-## 4. 第一步：找到请求入口
-
-先看 OpenAI-compatible server。
-
-你要搞清楚：
+### 3.4 API 进程到 Engine Core
 
 ```text
-/v1/chat/completions
-/v1/completions
+vllm/v1/engine/core_client.py
+  -> add_request_async()
+
+vllm/v1/engine/core.py
+  -> process_input_sockets()
 ```
 
-这些请求进入服务后，会被转换成什么内部对象。
+在线多进程拓扑中，请求通过 ZMQ 消息进入 Engine Core。Core 将 `EngineCoreRequest` 转成内部 `Request`，再加入 Scheduler。
 
-重点关注：
-
-1. HTTP 请求参数如何解析。
-2. SamplingParams 如何构造。
-3. prompt 如何 tokenize。
-4. 请求如何提交给 engine。
-5. streaming response 如何逐步返回。
-
-不要纠结 FastAPI 细节，重点是 API 层如何进入推理引擎。
-
-## 5. 第二步：读 Engine
-
-Engine 是连接 API 层和执行层的核心。
-
-你要找的问题：
+### 3.5 Scheduler
 
 ```text
-请求如何 add？
-每一轮 step 在哪里触发？
-输出如何被取走？
-请求取消如何处理？
+vllm/v1/core/sched/scheduler.py
+  -> add_request()
+  -> schedule()
+  -> update_from_output()
+  -> finish_requests()
 ```
 
-可以把 Engine 理解为主循环管理器：
+第一次只跟这些状态：
 
 ```text
-while has_requests:
-    scheduler.schedule()
-    executor.execute_model()
-    process_outputs()
+request.status
+request.num_tokens
+request.num_tokens_with_spec
+request.num_computed_tokens
+waiting / running
+token_budget
+num_scheduled_tokens
+req_to_new_blocks
 ```
 
-真实实现会更复杂，尤其 V1 多进程架构下，Engine 和 Worker 之间会有通信。但你先抓住这个抽象就够了。
+理解 `num_tokens_with_spec - num_computed_tokens` 后，prefill、decode 和 chunked prefill 会落到同一模型里。
 
-## 6. 第三步：读 Scheduler
-
-读 Scheduler 时只问 5 个问题：
-
-1. waiting 队列在哪里？
-2. running 队列在哪里？
-3. token budget 如何计算和扣减？
-4. prefill/decode 如何混排？
-5. KV block 不够时如何处理？
-
-建议边读边画状态机：
+### 3.6 KV Cache Manager
 
 ```text
-WAITING -> RUNNING -> FINISHED
-             |
-             v
-          PREEMPTED
+vllm/v1/core/kv_cache_manager.py
+  -> get_computed_blocks()
+  -> allocate_slots()
+  -> cache_blocks()
+  -> free()
 ```
 
-不要试图一次看懂所有功能分支。先把普通文本生成请求跑通，再看 prefix cache、spec decode、LoRA、多模态。
-
-## 7. 第四步：读 KV Cache Manager
-
-读 KV Cache 时，重点不是 tensor 形状，而是资源生命周期。
-
-你要追踪：
+再下钻：
 
 ```text
-初始化时分了多少 block？
-请求 prefill 时申请了多少 block？
-decode 追加 token 时什么时候需要新 block？
-请求结束时在哪里释放？
-共享 block 的 ref count 如何维护？
+block_pool.py
+single_type_kv_cache_manager.py
+kv_cache_utils.py
 ```
 
-可以自己写一个小表：
+观察 hash、ref count、free queue、touch 和 eviction，不要套用旧 Block Manager/COW 叙述。
 
-| 请求 | 逻辑 block | 物理 block | ref count |
-|---|---|---|---|
-| A | 0 | 101 | 1 |
-| A | 1 | 88 | 1 |
-| B | 0 | 101 | 2 |
+### 3.7 Engine Core 和 Executor
 
-这样你会更容易理解 prefix caching 和 Copy-on-Write。
-
-## 8. 第五步：读 Model Runner
-
-Model Runner 的核心问题是：
+同步基线：
 
 ```text
-调度结果如何变成模型输入？
+vllm/v1/engine/core.py:EngineCore.step()
+
+schedule
+  -> model_executor.execute_model
+  -> scheduler.update_from_output
 ```
 
-重点看：
+默认 async scheduling 则看 `step_with_batch_queue()`：它让多个 batch in flight，但单个 batch 的逻辑依赖没有改变。
 
-1. input_ids 如何拼接。
-2. positions 如何生成。
-3. block_tables 如何传入。
-4. slot_mapping 如何生成。
-5. seq_lens 如何传给 attention backend。
-6. logits 如何进入 sampler。
-
-读的时候建议画一张数据流图：
+### 3.8 Worker 与 Model Runner
 
 ```text
-SchedulerOutput
-  -> InputBatch
-  -> ModelInput
-  -> forward
-  -> logits
-  -> SamplerOutput
+vllm/v1/worker/gpu_worker.py
+vllm/v1/worker/gpu_model_runner.py       # V1
+vllm/v1/worker/gpu/model_runner.py       # V2
 ```
 
-## 9. 第六步：读 Sampler 和输出处理
+同步教学基线先看 V1 的 input preparation、`BlockTable`、slot mapping 和 sampler。之后去掉 `VLLM_USE_V2_MODEL_RUNNER=0`，根据日志确认默认是否选择 V2，再比较 V2 persistent batch/staged writes。
 
-很多人会忽略 Sampler，但线上服务里它很重要。
-
-因为不同请求可能有不同采样参数：
+### 3.9 Attention 与输出回程
 
 ```text
-temperature
-top_p
-top_k
-presence_penalty
-frequency_penalty
-max_tokens
-stop tokens
+vllm/v1/attention/backend.py
+vllm/v1/attention/backends/<selected_backend>.py
+
+vllm/v1/engine/output_processor.py
+vllm/v1/engine/async_llm.py:_run_output_handler()
 ```
 
-你要看：
+把写路径 `slot_mapping`、读路径 `block table` 与输出侧 detokenize/stop 分开追踪。stop string 在 API/OutputProcessor 侧结束时，Engine Core 仍必须收到 abort/finish 才能释放 KV ownership。
 
-1. logits 如何按请求切分。
-2. 每个请求如何应用自己的 SamplingParams。
-3. stop 条件在哪里判断。
-4. streaming token 如何返回。
-5. detokenize 在哪里做。
-
-## 10. 第七步：最后再看 Attention Backend / CUDA
-
-读到这里，你再看 attention backend，会清楚很多。
-
-你已经知道：
+## 4. 推荐阅读顺序
 
 ```text
-block table 是什么
-slot mapping 是什么
-seq_lens 是什么
-prefill 和 decode 为什么不同
+1. chat_completion/api_router.py
+2. chat_completion/serving.py
+3. async_llm.py + input_processor.py
+4. core_client.py + core.py
+5. scheduler.py
+6. kv_cache_manager.py + block_pool.py
+7. gpu_worker.py + 一个 Model Runner
+8. block_table.py + 当前 attention backend
+9. output_processor.py
+10. 默认 V2/async 路径差异
 ```
 
-再看 kernel 时，就不是盲读。
+不要一开始从 model definitions、所有 engine args 或单个 CUDA kernel 开始。
 
-你可以重点关注：
+## 5. 用运行轨迹代替静态抄代码
 
-1. prefill attention 是否走 FlashAttention 类 backend。
-2. decode attention 如何读取 paged KV cache。
-3. block table 如何传入 kernel。
-4. CUDA Graph 捕获和 replay 的边界在哪里。
-
-## 11. 推荐使用的调试方法
-
-### 11.1 加日志
-
-不要只靠静态阅读。
-
-可以在这些地方加日志：
+### 实验 A：一个请求、三个输出 token
 
 ```text
-add request
-schedule start/end
-allocated blocks
-execute_model start/end
-sampler output
-request finished
-```
-
-日志不要太细，否则高并发下会影响性能。调试时只跑小模型、小并发。
-
-### 11.2 单请求跑通
-
-先只跑一个请求：
-
-```text
-prompt: hello
-max_tokens: 5
+prompt: "hello"
+temperature: 0
+max_tokens: 3
 stream: true
 ```
 
-把每一轮 step 打出来。
+每轮记录：
 
-你会看到：
+- request status；
+- `num_tokens` 与 `num_computed_tokens`；
+- scheduled token 数；
+- block IDs；
+- sampler token；
+- 是否 finished/free。
 
-```text
-prefill once
-then decode token by token
-```
-
-### 11.3 双请求观察 continuous batching
-
-再跑两个请求：
+### 实验 B：两个请求 continuous batching
 
 ```text
-A: 短 prompt，短输出
-B: 长 prompt，长输出
+A: input 128, output 128
+B: input 4096, output 16，稍晚到达
 ```
 
-观察它们如何进入 waiting/running，如何混排。
+观察 B 进入后，A decode 与 B prefill chunk 如何共享 token budget。
 
-### 11.4 长 prompt 观察 chunked prefill
+### 实验 C：默认路径对照
 
-构造一个长 prompt，看 prefill 是否被拆成 chunk。
+移除教学参数，记录：
 
-重点观察：
+- V1 还是 V2 Model Runner；
+- async scheduling 是否启用；
+- attention backend；
+- optimization/CUDA Graph 模式；
+- Nsight 时间线上 CPU/GPU 是否重叠。
+
+## 6. 日志应该怎样加？
+
+只在小模型、小请求、同步基线中加结构化日志：
 
 ```text
-每轮 token budget 如何分配
-长 prefill 是否阻塞 decode
+step_id
+request_id
+status_before/after
+num_tokens / num_computed_tokens
+num_scheduled_tokens
+new_block_ids
+sampled_token_ids
+finish_reason
 ```
 
-## 12. 建议做的源码阅读笔记
+不要记录完整 prompt，也不要在正式性能压测时保留逐 token Python 日志。日志改变 CPU 开销和时序，调试结果不能直接当性能结果。
 
-每读一个模块，写 4 个部分：
+## 7. 源码笔记模板
 
 ```text
-模块职责：它负责什么？
-核心数据结构：它维护哪些状态？
-输入输出：上游给它什么，它给下游什么？
-关键问题：如果出 bug，可能表现为什么？
+版本/commit：
+运行配置：V1/V2、sync/async、backend、TP/DP
+入口 symbol：
+输入：
+持有的状态：
+输出：
+上游/下游：
+失败/清理路径：
+本次观察事实：
+源码事实：
+仍待验证：
 ```
 
-例如 Scheduler：
+区分“运行观察”和“由源码推断”能避免把某个模型/配置的现象写成框架不变量。
 
-```text
-职责：选择下一轮执行请求
-数据结构：waiting/running、token budget、scheduled outputs
-输入：新请求、运行中请求、资源状态
-输出：本轮要执行的 batch
-问题：TTFT 高、decode 卡顿、抢占频繁、GPU 利用率低
-```
+## 8. 验收标准
 
-## 13. 最小源码阅读任务
+最终交付：
 
-如果你想形成简历项目，可以做一个最小任务：
+1. 一张 HTTP → Scheduler → GPU → SSE 流程图；
+2. 一份单请求逐 step trace；
+3. 一份双请求混排 trace；
+4. V1 sync 与默认 V2/async 的差异表；
+5. 一个取消请求后 KV 被释放的反向链路说明。
 
-```text
-目标：解释一次请求从 HTTP 到 token streaming 的完整链路。
-
-产物：
-1. 一张流程图
-2. 一篇源码阅读笔记
-3. 一个带日志的本地 demo
-4. 一组不同参数下的现象对比
-```
-
-这个任务比“我看过 vLLM 源码”有说服力得多。
-
-## 14. 本文小结
-
-读 vLLM 源码，最重要的是顺序。
-
-推荐主线：
-
-```text
-请求入口
-  -> Engine
-  -> Scheduler
-  -> KV Cache Manager
-  -> Model Runner
-  -> Sampler / Output
-  -> Attention Backend / CUDA
-```
-
-不要从最难的 kernel 开始，也不要死记配置参数。
-
-读源码的目标是建立一张运行时地图：
-
-```text
-请求状态怎么流动，GPU 资源怎么分配，KV Cache 怎么管理，输出 token 怎么返回。
-```
+如果只能背类名，仍不算读通；能够用 request state 和 token/KV ownership 解释每一步，才算完成。
 
 ## 参考资料
 
-- vLLM 官方文档：https://docs.vllm.ai/
-- vLLM 架构设计文档：https://docs.vllm.ai/en/latest/design/architecture.html
-- vLLM GitHub：https://github.com/vllm-project/vllm
+- [vLLM v0.25.0 Architecture Overview](https://docs.vllm.ai/en/v0.25.0/design/arch_overview/)
+- [vLLM v0.25.0 Model Runner V2 Design](https://docs.vllm.ai/en/v0.25.0/design/model_runner_v2/)
+- [vLLM v0.25.0 Prefix Caching Design](https://docs.vllm.ai/en/v0.25.0/design/prefix_caching/)
+- [vLLM v0.25.0 CUDA Graphs](https://docs.vllm.ai/en/v0.25.0/design/cuda_graphs/)

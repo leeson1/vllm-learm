@@ -1,329 +1,237 @@
-# 14｜vLLM vs TensorRT-LLM vs SGLang
+# 14｜以 vLLM v0.25.0 为基线比较 TensorRT-LLM 与 SGLang
 
-这一篇做推理框架对比。
+> 比较基线：vLLM 固定 v0.25.0、commit `702f4814fe54fabff350d43cb753ae3e47c0c276`。TensorRT-LLM 与 SGLang 必须在实际评测时另行固定版本/commit、依赖和启动配置；本文比较工程侧重点，不宣称跨版本的绝对性能排名。
 
-注意：这不是选边站。vLLM、TensorRT-LLM、SGLang 都是优秀的 LLM Serving / Inference 方向项目，只是设计重心不同。
+## 1. 先给结论
 
-更合理的问题不是：
-
-```text
-哪个框架最强？
-```
-
-而是：
+三个项目都能服务 LLM，请不要用一句“谁更快”代替选型：
 
 ```text
-我的业务场景、硬件环境、团队能力和优化目标，适合哪个框架？
+vLLM v0.25.0
+  通用模型服务与研究/生产功能面
+  V1 Engine、continuous batching、paged KV、丰富 endpoint/后端
+
+TensorRT-LLM
+  NVIDIA 平台上的模型与 kernel/通信优化栈
+  更强调硬件特化、低精度和多 GPU 性能工程
+
+SGLang
+  LLM serving/runtime 与复杂生成程序
+  强调前缀复用、结构化生成和应用执行形态
 ```
 
-## 1. 先给一个粗略定位
+它们的能力范围持续重叠。选型必须绑定模型、硬件、API、workload、SLO 和团队维护成本。
 
-| 框架 | 粗略定位 | 更适合关注 |
-|---|---|---|
-| vLLM | 通用 LLM Serving 引擎 | 易用性、PagedAttention、OpenAI API、生态、快速部署 |
-| TensorRT-LLM | NVIDIA GPU 上的高性能 LLM 推理优化栈 | 极致性能、TensorRT engine、NVIDIA 硬件优化、多卡部署 |
-| SGLang | 面向结构化生成和复杂 LLM 程序的 serving/runtime | RadixAttention、结构化输出、多轮/Agent/RAG 复杂流程 |
-
-这只是入门定位，真实选择必须压测。
-
-## 2. vLLM 的特点
-
-vLLM 的核心标签：
+可以先用“主要关注层次”建立位置感，边界并不绝对：
 
 ```text
-PagedAttention
-continuous batching
-OpenAI-compatible API
-易部署
-高吞吐 serving
+更靠近应用
+
+  复杂生成程序 / structured output / Agent runtime
+      └──────────────────────────── SGLang 重点之一
+
+  OpenAI API / 通用 Serving / 调度 / KV 管理
+      └──────────── vLLM v0.25.0 的典型学习主线
+
+  模型执行 / 低精度 / kernel / 多 GPU 通信
+      └──────────────────── TensorRT-LLM 重点之一
+
+  NVIDIA GPU / CUDA / Tensor Core / NVLink
+
+更靠近硬件
+
+三者都可能跨越多层；图表示学习和选型切入点，不是功能边界。
 ```
 
-它最适合用来学习 LLM Serving 的系统工程，因为模块边界非常典型：
+## 2. vLLM v0.25.0 的具体位置
+
+### 服务面
+
+- OpenAI-compatible API 与离线 `LLM`；
+- Chat/Completions/Responses、pooling 等多类入口；
+- `vllm bench serve` 和 Prometheus metrics；
+- TP、PP、DP、EP 等并行方式；
+- 多种 attention backend、quantization 和 speculative 方法。
+
+### 执行面
+
+- V1 Engine 统一请求状态、Scheduler 和 KV 管理；
+- 支持时默认 chunked prefill 与 prefix caching；
+- 兼容配置下默认 async scheduling；
+- 多数受支持的非 MoE 生成模型默认 Model Runner V2；
+- 默认 optimization level O2，CUDA Graph 模式随 backend 能力解析；
+- paged KV 通过 block table/slot metadata 接入不同 attention backend。
+
+### 工程代价
+
+- 功能组合多，配置兼容矩阵复杂；
+- V1/V2 Runner、sync/async、backend/graph 会形成不同路径；
+- Python/PyTorch 服务和控制面仍需要 CPU 性能工程；
+- 版本演进快，源码笔记和默认值必须固定 tag。
+
+## 3. TensorRT-LLM 应怎样理解？
+
+TensorRT-LLM 更贴近 NVIDIA 推理优化生态，重点通常包括：
+
+- NVIDIA GPU 特化 kernels 和低精度路径；
+- tensor/pipeline/expert parallel 与通信优化；
+- 模型转换、构建/编译或运行时配置；
+- KV Cache、in-flight batching、speculative decoding 等 serving 能力；
+- 与 Triton Inference Server、NVIDIA 部署栈的整合。
+
+它不等于“任何 NVIDIA GPU 上自动比 vLLM 快”。实际结果受到支持矩阵、模型结构、精度、构建参数、GPU 架构、batch 和上下文长度影响。
+
+对学习者的价值是：看到更硬件特化的 kernel、量化、engine/runtime 和多卡优化怎样组织。代价是环境、构建、模型支持和版本耦合通常更需要工程投入。
+
+## 4. SGLang 应怎样理解？
+
+SGLang 同时面向高性能 serving 和复杂 LLM 程序/runtime。学习时重点关注：
+
+- 前缀树/RadixAttention 类复用；
+- continuous batching 与请求调度；
+- structured output/constraint decoding；
+- 多轮、RAG、Agent、工具调用中的共享执行结构；
+- 多模型/多模态与分布式 serving。
+
+它不只是“Agent 框架”，也不能因为有前缀复用就直接断言某类 workload 必然优于 vLLM APC。两者缓存粒度、调度、backend 和请求结构需要用同一输入分布实测。
+
+## 5. 不应该直接比较的配置
+
+以下比较没有意义：
 
 ```text
-API
-Scheduler
-KV Cache Manager
-Model Runner
-Attention Backend
-Worker
+不同模型 revision
+不同量化格式或质量
+不同 max context / max output
+一个 ignore_eos、另一个遇 EOS 停止
+一个启用 prefix cache、另一个没有共享前缀
+一个 TP=2、另一个单卡
+一个测固定并发、另一个测固定 QPS
+一个预热完成、另一个包含 compile/build
+客户端和 token 统计口径不同
 ```
 
-对后端开发来说，vLLM 的学习价值非常高。
+框架 benchmark 最难的不是跑命令，而是保证语义和资源配置等价。
 
-## 3. vLLM 的优势
+## 6. 统一比较矩阵
 
-### 3.1 上手快
-
-启动一个 OpenAI-compatible server 比较直接：
-
-```bash
-vllm serve <model>
-```
-
-业务可以用 OpenAI API 形式接入。
-
-### 3.2 Serving 抽象清晰
-
-vLLM 的调度、KV Cache、模型执行、输出处理都比较适合学习。
-
-如果你的目标是转 AI 推理岗位，vLLM 是很好的切入口。
-
-### 3.3 PagedAttention 代表性强
-
-PagedAttention 是 vLLM 最经典的设计。
-
-它把 KV Cache 拆成 block，用类似分页的方式降低显存碎片，支持更高并发和更灵活的内存管理。
-
-### 3.4 生态活跃
-
-vLLM 支持 OpenAI-compatible API、多种模型、量化、prefix caching、speculative decoding、多卡等能力。
-
-它的工程生态对学习和原型验证都比较友好。
-
-## 4. vLLM 的局限
-
-### 4.1 极致性能未必总是最优
-
-vLLM 很通用，但在特定 NVIDIA 硬件、特定模型、特定 batch 形态下，TensorRT-LLM 这类深度优化方案可能更强。
-
-### 4.2 Python 服务栈仍在关键路径中
-
-虽然核心计算在 GPU，但服务端调度、请求处理、tokenizer、输出等仍涉及 CPU 和 Python 侧工程。
-
-高压场景下 CPU 也可能成为瓶颈。
-
-### 4.3 功能多导致配置复杂
-
-模型、量化、并行、attention backend、prefix/spec decode 都有很多参数。
-
-真正线上用好仍然需要压测和调优。
-
-## 5. TensorRT-LLM 的特点
-
-TensorRT-LLM 是 NVIDIA 面向大模型推理的优化工具链。
-
-它的核心标签：
+### 6.1 固定环境
 
 ```text
-TensorRT engine
-NVIDIA GPU 深度优化
-高性能 kernel
-FP8 / INT8 / INT4 等量化
-多 GPU / 多节点优化
+GPU 型号/数量/功耗与时钟策略
+CPU/NUMA/内存/互联
+driver/CUDA/container
+框架 commit 和依赖
+模型 checkpoint/revision
+dtype/quantization/KV dtype
 ```
 
-如果你追求 NVIDIA GPU 上的极限性能，TensorRT-LLM 是绕不开的。
+### 6.2 固定 workload
 
-## 6. TensorRT-LLM 的优势
+至少覆盖：
 
-### 6.1 更贴近 NVIDIA 硬件优化
+| Workload | 目的 |
+|---|---|
+| 128 in / 32 out | 服务与 launch overhead |
+| 4096 in / 32 out | prefill、chunking、prefix |
+| 128 in / 512 out | decode/KV/ITL |
+| 4096 in / 512 out | 容量、preemption、尾延迟 |
+| 共享 4K 前缀 | cache reuse |
+| burst trace | queue 与 goodput |
 
-TensorRT-LLM 可以利用 NVIDIA 生态中的优化能力，包括 TensorRT engine、专用 kernel、低精度计算、多 GPU 通信优化等。
+### 6.3 固定输出语义
 
-### 6.2 适合性能压榨
+- temperature/top-p/top-k/seed；
+- EOS 与最大输出长度；
+- chat template；
+- stop 条件；
+- structured output/grammar；
+- tokenizer 和 token 计数。
 
-如果业务模型固定、场景稳定、团队有足够工程能力，TensorRT-LLM 可能带来更好的性能上限。
+### 6.4 同时报告
 
-### 6.3 部署大模型、多卡优化能力强
+- TTFT、TPOT/ITL、E2E；
+- request/input/output throughput；
+- goodput；
+- 峰值显存与最大稳定并发；
+- 启动/构建时间；
+- 错误率、质量和功能缺口；
+- 部署包大小、运维和升级成本。
 
-在多 GPU、多节点、FP8、量化、并行策略等方面，TensorRT-LLM 有很强的 NVIDIA 体系支持。
+## 7. 按目标选择起点
 
-## 7. TensorRT-LLM 的局限
+### 学习通用推理服务
 
-### 7.1 上手成本更高
+优先 vLLM v0.25.0：可以从 HTTP、Scheduler、KV Cache 一路追到 Model Runner、attention backend 和 CUDA Graph，且本仓库已经固定源码。
 
-相比 vLLM，TensorRT-LLM 更偏底层优化栈。
+### 深入 NVIDIA 性能栈
 
-你需要理解：
+完成 vLLM 的可复现基线后，再用相同模型/workload 对照 TensorRT-LLM。重点研究 kernel/quantization/通信/构建差异，而不是只跑一个吞吐数字。
+
+### 复杂生成程序和前缀结构
+
+当业务确实包含共享 system prompt、树状对话、RAG、structured output 或 Agent flow，再评估 SGLang。用真实请求结构，不要只用随机 prompts。
+
+## 8. 对推理工程师最有价值的比较方式
+
+不要写“框架功能表”作为最终项目。做一个可解释案例：
 
 ```text
-engine build
-模型转换
-plugin
-quantization
-并行策略
-NVIDIA 软件栈版本兼容
+同一 7B/8B 模型
+同一 GPU
+同一五类 workload
+同一精度和输出语义
+
+找出：
+1. 容量拐点在哪里
+2. TTFT/TPOT 分别由什么决定
+3. 前缀复用何时生效
+4. GPU 时间线和主要 kernel 有何不同
+5. 为达到同一 SLO，哪个配置成本更低
 ```
 
-### 7.2 灵活性可能弱于通用 serving 框架
+最终结论可以是“没有统一赢家”。能解释 trade-off 才体现推理工程能力。
 
-当模型频繁变化、业务需要快速接入新模型时，TensorRT-LLM 的构建和调试成本可能更高。
+## 9. 推荐学习顺序
 
-### 7.3 强依赖 NVIDIA 生态
-
-如果你要跨 AMD、TPU、CPU 等硬件，TensorRT-LLM 不是通用路线。
-
-## 8. SGLang 的特点
-
-SGLang 的核心标签：
+结合 C++/Go、CUDA 基础和 vLLM 部署经验：
 
 ```text
-structured generation
-RadixAttention
-复杂 LLM 程序
-多轮对话 / Agent / RAG
-OpenAI-compatible serving
+1. vLLM v0.25.0 请求/KV/Scheduler 主链路
+2. vLLM benchmark + Nsight，形成可信基线
+3. vLLM attention backend 或 paged KV microbenchmark
+4. TensorRT-LLM：同模型、同 GPU、同 workload
+5. SGLang：加入 shared-prefix/structured workload
 ```
 
-它不只是推理 backend，也强调如何表达和执行复杂的 LLM 程序。
+没有完成第 2 步时，直接进入三框架比较很容易变成安装记录。
 
-例如：
+## 10. 验收标准
 
-```text
-多次 generate
-分支控制
-并行请求
-结构化输出
-JSON / constrained decoding
-```
+一份合格的选型报告应该：
 
-这些场景下，SGLang 的设计重心和 vLLM 不完全一样。
+1. 固定三个框架的版本/commit；
+2. 证明模型、精度和请求语义等价；
+3. 同时报告 latency、throughput、goodput、capacity 和质量；
+4. 保存完整命令和原始数据；
+5. 用 profiler/metrics 解释至少一个差异；
+6. 把“测得事实”与“推测原因”分开；
+7. 给出针对业务 workload 的选择，而不是普遍排名。
 
-## 9. SGLang 的优势
+## 11. vLLM v0.25.0 源码核对入口
 
-### 9.1 对复杂 LLM 程序友好
-
-如果业务不是简单的一问一答，而是：
-
-```text
-RAG 多阶段流程
-Agent 工具调用
-结构化 JSON 输出
-多轮状态复用
-复杂 prompt 程序
-```
-
-SGLang 的前端表达和 runtime 优化更有吸引力。
-
-### 9.2 RadixAttention 强调前缀复用
-
-SGLang 的 RadixAttention 关注 KV Cache 复用，适合大量共享前缀、多轮、多分支场景。
-
-### 9.3 结构化输出能力突出
-
-复杂业务经常需要稳定 JSON、schema、约束解码。
-
-SGLang 在这类场景的定位更明确。
-
-## 10. SGLang 的局限
-
-### 10.1 学习目标更偏复杂应用 runtime
-
-如果你的第一目标是理解基础 LLM Serving 系统，vLLM 的主链路更直观。
-
-SGLang 的学习价值很高，但它的重点更偏“复杂 LLM 程序如何高效执行”。
-
-### 10.2 生态和部署要结合业务评估
-
-是否适合生产，要看模型支持、硬件、团队使用经验、已有业务接入方式和压测结果。
-
-## 11. 三者对比维度
-
-| 维度 | vLLM | TensorRT-LLM | SGLang |
-|---|---|---|---|
-| 上手难度 | 较低 | 较高 | 中等 |
-| 学习 serving 主链路 | 很适合 | 偏底层优化 | 适合复杂 runtime |
-| NVIDIA 极致优化 | 较强 | 很强 | 较强 |
-| 跨硬件通用性 | 较好 | 弱，主要 NVIDIA | 较好 |
-| OpenAI API 接入 | 支持 | 可通过服务层支持 | 支持 |
-| KV Cache 优化 | PagedAttention | Paged KV cache 等 | RadixAttention |
-| 结构化生成 | 支持相关能力 | 不是主要定位 | 强定位 |
-| 适合新手切入 | 很适合 | 不建议第一站 | 可作为第二站 |
-
-## 12. 应该怎么选？
-
-### 12.1 学习 AI 推理，优先 vLLM
-
-如果你的目标是转 AI 推理/HPC：
-
-```text
-第一站：vLLM
-第二站：CUDA / attention backend / TensorRT-LLM
-第三站：SGLang / 复杂 serving runtime
-```
-
-原因：
-
-1. vLLM 的服务端结构清晰。
-2. PagedAttention 是经典设计。
-3. 上手和压测成本低。
-4. 很适合从后端视角迁移。
-
-### 12.2 追求 NVIDIA 极致性能，看 TensorRT-LLM
-
-如果业务特点是：
-
-```text
-模型固定
-硬件固定为 NVIDIA
-吞吐/延迟目标极高
-团队有 CUDA/TensorRT 经验
-```
-
-TensorRT-LLM 值得深入。
-
-### 12.3 复杂 Agent / RAG / 结构化输出，看 SGLang
-
-如果业务特点是：
-
-```text
-多轮程序
-共享前缀多
-结构化输出强
-复杂控制流
-```
-
-SGLang 值得重点评估。
-
-## 13. 面试中如何表达三者差异？
-
-可以这样说：
-
-```text
-vLLM 更像通用高吞吐 LLM Serving 引擎，核心是 PagedAttention、continuous batching 和 KV Cache 管理。
-
-TensorRT-LLM 更贴近 NVIDIA GPU 极致优化，通过 TensorRT engine、低精度 kernel、多卡优化来压榨性能，上手和工程成本更高。
-
-SGLang 更强调复杂 LLM 程序和结构化生成场景，通过 runtime 级 KV 复用和约束解码优化多轮、RAG、Agent 类 workload。
-```
-
-这比简单说“哪个更快”更专业。
-
-## 14. 学习路线建议
-
-结合你的后端背景，建议顺序：
-
-```text
-1. vLLM：建立 LLM Serving 主链路
-2. 压测：掌握 TTFT / TPOT / tokens/s / KV Cache 指标
-3. CUDA 基础：理解 kernel、memory hierarchy、profiling
-4. TensorRT-LLM：理解 NVIDIA 优化栈
-5. SGLang：理解复杂 LLM 程序和结构化生成 runtime
-```
-
-不要一开始就跳 TensorRT-LLM。
-
-否则很容易陷入环境、编译、engine build、版本兼容，而没有建立 serving 主线。
-
-## 15. 本文小结
-
-三者不是互斥关系，而是学习和业务选择的不同侧重。
-
-你需要记住：
-
-1. vLLM：最适合建立 LLM Serving 系统认知。
-2. TensorRT-LLM：适合 NVIDIA GPU 上追求更极致性能。
-3. SGLang：适合复杂 LLM 程序、结构化输出、前缀复用场景。
-4. 真正选型必须用自己的 workload 压测。
-5. 对转岗来说，先 vLLM，再 CUDA/TensorRT-LLM，是更稳的路线。
+- `vllm/v1/engine/`：请求与 Engine Core。
+- `vllm/v1/core/sched/`：调度。
+- `vllm/v1/core/kv_cache_manager.py`：KV ownership/APC。
+- `vllm/v1/worker/`：Worker 与 V1/V2 Model Runner。
+- `vllm/v1/attention/backends/`：backend 实现。
+- `vllm/model_executor/layers/quantization/`：量化。
+- `vllm/benchmarks/serve.py`：在线基准。
 
 ## 参考资料
 
-- vLLM 官方文档：https://docs.vllm.ai/
-- vLLM GitHub：https://github.com/vllm-project/vllm
-- NVIDIA TensorRT-LLM 文档：https://nvidia.github.io/TensorRT-LLM/
-- NVIDIA TensorRT-LLM GitHub：https://github.com/NVIDIA/TensorRT-LLM
-- SGLang 官方文档：https://docs.sglang.ai/
-- SGLang GitHub：https://github.com/sgl-project/sglang
-- SGLang 论文：https://arxiv.org/abs/2312.07104
+- [vLLM v0.25.0 文档](https://docs.vllm.ai/en/v0.25.0/)
+- [vLLM v0.25.0 Parallelism and Scaling](https://docs.vllm.ai/en/v0.25.0/serving/parallelism_scaling/)
+- [vLLM v0.25.0 Attention Backends](https://docs.vllm.ai/en/v0.25.0/design/attention_backends/)
+- [NVIDIA TensorRT-LLM 文档](https://nvidia.github.io/TensorRT-LLM/)
+- [SGLang 文档](https://docs.sglang.ai/)
