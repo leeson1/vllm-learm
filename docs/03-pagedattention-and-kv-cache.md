@@ -1,279 +1,242 @@
 # 03｜核心原理：PagedAttention 与 KV Cache 管理
 
-这一篇讲 vLLM 最核心的概念：KV Cache 和 PagedAttention。
+> 版本基线：vLLM v0.25.0，重点讲 V1 的 paged KV Cache 与 Automatic Prefix Caching。官方 Paged Attention kernel 页面已标为历史文档，本文只把它用于概念背景，不把它当作当前所有 backend 的唯一实现。
 
 如果只记一句话：
 
 ```text
-vLLM 通过 PagedAttention 把每个请求的 KV Cache 拆成固定大小的 block，用类似操作系统分页的方式管理 GPU 显存，从而减少碎片，提高并发。
+vLLM 启动时建立 KV Cache 物理 block 池；调度时按请求分配 block ID，
+用 block table 把逻辑 token 位置映射到物理 KV slots。
 ```
 
-## 1. 为什么会有 KV Cache？
+## 1. 为什么需要 KV Cache？
 
-LLM 生成文本是自回归的：
+Decoder-only LLM 自回归生成：
 
 ```text
-已有 token -> 生成下一个 token -> 再把新 token 加入上下文 -> 继续生成
+prompt -> token T1 -> token T2 -> token T3 -> ...
 ```
 
-例如：
+每层 self-attention 都需要历史 token 的 Key 和 Value。如果生成每个 token 时都重新计算完整历史，重复工作会随序列增长。推理引擎因此保存已经计算过的 K/V，后续迭代读取缓存，只计算新增 token 对应的模型状态。
+
+一个容易忽略的时序是：本轮采样出的 token 还没有作为模型输入执行，它对应的 KV 要到下一轮 forward 才写入。可以把标准路径理解为：
 
 ```text
-输入：我 喜欢
-输出第 1 个 token：写
-上下文变成：我 喜欢 写
-输出第 2 个 token：代码
-上下文变成：我 喜欢 写 代码
+已计算 prompt KV -> 采样 T1
+输入 T1 并写入 T1 的 KV -> 采样 T2
+输入 T2 并写入 T2 的 KV -> 采样 T3
 ```
 
-Transformer 每一层 attention 都需要用到历史 token 的 Key 和 Value。
+这也是 V1 Scheduler 用 `num_computed_tokens` 追赶当前 token 数来统一 prefill 和 decode 的基础。
 
-如果每生成一个 token 都重新计算全部历史 token 的 Key/Value，代价非常高。因此推理时会把历史 token 的 K/V 缓存下来，这就是 KV Cache。
+## 2. KV Cache 到底有多大？
 
-## 2. KV Cache 为什么会成为瓶颈？
-
-模型权重是固定的，但 KV Cache 是动态的。
-
-它和下面几个因素相关：
+对普通 decoder-only attention，先忽略 TP、对齐和特殊 attention，每个请求每个 token 的 KV 字节数可粗略估算为：
 
 ```text
-KV Cache 大小 ∝ 层数 × KV head 数 × head_dim × token 数 × 并发请求数 × dtype 大小
+KV bytes/token
+  = 2 × num_layers × num_kv_heads × head_dim × bytes_per_element
 ```
 
-这意味着：
+- `2`：一份 Key 和一份 Value。
+- `num_kv_heads`：不是 query head 数；GQA/MQA 会显著减少 KV heads。
+- `bytes_per_element`：由 KV Cache dtype 决定，不一定和量化权重格式相同。
 
-- 模型越大，KV Cache 越大。
-- 上下文越长，KV Cache 越大。
-- 并发越高，KV Cache 越大。
-- 输出越长，decode 阶段 KV Cache 会继续增长。
+活动请求的粗略总量再乘以它们当前缓存的 token 数。
 
-在线服务里，很多时候不是模型权重放不下，而是并发起来后 KV Cache 顶不住。
+这个公式不适合直接套到所有模型：
 
-## 3. 传统 KV Cache 管理的问题
+- TP 下 KV heads 可能被分片或复制，每卡大小不总是简单除以 TP 数。
+- MLA 使用不同的潜在表示。
+- 滑动窗口、local attention、Mamba/attention 混合模型有不同 cache spec。
+- block 对齐、元数据和 backend workspace 也会产生额外开销。
 
-一种朴素做法是：给每个请求预留一段连续显存。
+因此公式用于建立量级直觉；实际容量以 vLLM 启动日志中的 `GPU KV cache size` 和 `Maximum concurrency` 为准。
 
-比如一个请求最多支持 8192 token，就提前分配足够大的空间。
+## 3. 连续大块分配有什么问题？
 
-问题很明显：
+PagedAttention 论文讨论的朴素基线，是按请求最大长度预留连续 KV 空间。假设请求最多 8192 token，但实际只使用 300 token，会产生大量预留浪费；变长请求反复进入和退出还会造成外部碎片。
 
-### 3.1 预留浪费
+这里要保持表述边界：这是解释 paged 设计动机的对照模型，不代表所有非 vLLM 引擎今天都仍采用同一种朴素实现。
 
-用户可能只输入了 200 token，输出 100 token，但你为了支持最大长度，可能预留了 8192 token 的空间。
+分页后仍有内部浪费：一个序列的最后一个未填满 block 会留下空 slot。但浪费被限制在 block 粒度，而不是整个最大序列长度。
 
-### 3.2 内部碎片
+## 4. 两层“分配”不要混淆
 
-请求 A 用了 300 token，但分配了 8192 token，剩下的大量空间不可用。
+### 4.1 启动阶段：建立物理 KV Cache
 
-### 3.3 外部碎片
+Worker 加载模型后会做内存 profiling，依据可用预算计算 KV Cache 配置，并在 GPU 上创建 KV Cache tensors。`gpu_memory_utilization` 或显式 `kv_cache_memory_bytes` 会影响这一步。
 
-GPU 显存里有很多空洞，但没有足够大的连续空间给新请求。
+这是一块长期存在的设备内存池。
 
-### 3.4 共享困难
+### 4.2 调度阶段：分配 block 所有权
 
-多个请求有相同前缀时，理论上可以复用前缀 KV Cache。但如果每个请求都是一整段连续缓存，共享和写时复制会比较麻烦。
+请求进入 Engine Core 时，Scheduler 还没有立即为它占满最大上下文。下一次调度会：
 
-## 4. PagedAttention 的核心思想
+1. 查找可复用的完整前缀 blocks。
+2. 计算本轮要处理多少新 token。
+3. 向 `KVCacheManager.allocate_slots()` 申请所需 block IDs。
+4. 把 block IDs 发送给 Worker/Model Runner。
 
-PagedAttention 借鉴操作系统虚拟内存分页。
+所以“按需分配”指从已建立的 pool 中取得 block，并更新引用计数和请求映射；不是每个 token 都触发 `cudaMalloc`。
 
-操作系统里：
+## 5. Logical block、physical block 与 slot
+
+设 block size 为 4 个 token，一个请求有 10 个需要缓存的 token：
 
 ```text
-虚拟地址连续
-物理内存可以不连续
-页表负责虚拟页 -> 物理页映射
+logical blocks:  L0=[t0..t3]  L1=[t4..t7]  L2=[t8..t9]
+block table:     L0 -> P7     L1 -> P2     L2 -> P9
 ```
 
-vLLM 里可以类比为：
+物理上：
 
 ```text
-请求的 token 序列逻辑上连续
-KV Cache 物理 block 可以不连续
-block table 负责 logical block -> physical block 映射
+P0  P1  P2:L1  P3  P4  P5  P6  P7:L0  P8  P9:L2
 ```
 
-一个请求的 KV Cache 不再需要是一整段连续显存，而是由多个固定大小 block 组成。
-
-示意：
+逻辑序列连续，但 physical block IDs 可以离散。对某个 token position，Model Runner 根据 block table 和 block size 得到：
 
 ```text
-Request A logical blocks:
-[A0] [A1] [A2]
-
-Block table:
-A0 -> physical block 7
-A1 -> physical block 2
-A2 -> physical block 9
-
-GPU physical KV blocks:
-[0] [1] [2:A1] [3] [4] [5] [6] [7:A0] [8] [9:A2]
+logical_block_index = position // block_size
+offset_in_block      = position % block_size
+physical_block_id    = block_table[logical_block_index]
+slot                 = physical_block_id * block_size + offset_in_block
 ```
 
-逻辑上 A0/A1/A2 连续，但物理上可以散落在不同位置。
+真实 v0.25.0 还要处理多个 KV cache groups、混合 attention、speculative slots 等情况；上式只是标准单组 attention 的核心映射。
 
-## 5. 为什么这样能省显存？
+## 6. 为什么分页能改善容量利用率？
 
-### 5.1 按需分配
+### 6.1 请求按增长分配
 
-请求刚进来时，只需要为已有 token 分配 block。生成过程中不够了再分配新 block。
+请求只持有当前计算和必要 lookahead 所需的 blocks。随着序列增长再获得新 block；结束或抢占后释放所有权。
 
-### 5.2 减少碎片
+### 6.2 固定规格便于池化复用
 
-固定大小 block 比大块连续空间更容易复用。
+请求不再要求一段足以容纳最大上下文的连续物理区域。任何可回收的合适 block ID 都能重新分配，显著降低外部碎片问题。
 
-这类似内存池/slab allocator：统一规格的小块比变长大块更容易管理。
+### 6.3 block table 解耦逻辑顺序与物理地址
 
-### 5.3 支持共享
+Scheduler 管理的是请求到 block IDs 的账本；Worker 持有真正的 KV tensors。Attention backend 通过 block table/slot mapping 访问正确位置，不要求一个请求的 K/V 物理连续。
 
-如果两个请求有相同前缀，它们可以指向同一批 physical block。
+## 7. V1 Automatic Prefix Caching 怎么工作？
 
-例如：
+APC 与 paged layout 相关，但不是同一个概念：
+
+- Paged KV Cache 解决 block 化存储与寻址。
+- APC 决定哪些已经计算的完整 blocks 可以跨请求复用。
+
+v0.25.0 V1 使用链式 hash。一个 block 的身份包含：
 
 ```text
-Request A: 你是一个游戏后端专家，请解释 Redis 排行榜
-Request B: 你是一个游戏后端专家，请解释 vLLM KV Cache
-
-共同前缀：你是一个游戏后端专家，请解释
+parent block hash
++ current block token IDs
++ extra hashes（例如 LoRA、multi-modal input、cache_salt）
 ```
 
-共同前缀对应的 KV block 可以共享。后续不同部分再分配各自 block。
+父 hash 使“相同 block token、不同历史前缀”不会被当成同一份 KV。官方实现只缓存完整 block，因为部分 block 还没有稳定的完整 token 内容。
 
-### 5.4 支持写时复制
+新请求到达时，`get_computed_blocks()` 查找最长完整 block 前缀。即使整个 prompt 都命中，v0.25.0 仍会保留最后一个 token 重新计算以得到 logits；受 block 对齐限制，实际重算有时会覆盖一个完整 block。
 
-如果共享 block 后面需要修改，可以 copy-on-write。
+### 7.1 ref count、free queue 与 cache mapping
 
-这和操作系统 fork 后共享物理页、写入时复制的思想类似。
+`KVCacheBlock` 记录 `block_id`、`block_hash` 和 `ref_cnt`。一个 block 可以同时被多个请求引用。
 
-## 6. PagedAttention 对 attention 计算有什么影响？
+请求结束时：
 
-传统 attention 计算时，通常假设 K/V 在连续内存里。
+- 请求到 blocks 的映射被移除；
+- blocks 的引用计数下降；
+- 引用为 0 的 block 回到 free queue；
+- 已缓存的完整 block hash 映射可以继续保留，直到该 block 真正被重新分配时按 LRU 规则驱逐。
 
-PagedAttention 下，K/V 被拆成 block，而且物理地址不连续。因此 attention kernel 需要根据 block table 找到每个 logical block 对应的 physical block。
+因此“free”不等于立即擦除所有 prefix cache 元数据。一个 `ref_cnt=0` 的缓存 block 既可被相同前缀再次命中，也可在容量不足时被驱逐并复用。
 
-也就是说，PagedAttention 不只是一个内存管理策略，它还要求 attention kernel 能理解这种分页布局。
+### 7.2 为什么这里不需要泛化成写时复制？
 
-这也是为什么 vLLM 不只是 Python 调度代码，还包含底层 kernel 和 attention backend。
+对 APC，共享的是已经计算完成的前缀 full blocks。新请求的不同后缀会分配新 blocks，不会回头修改共享前缀，因此不能简单描述成“共享后写入就 copy-on-write”。
 
-## 7. 和后端开发经验怎么类比？
+PagedAttention 原论文还讨论 parallel sampling/beam search 的共享，这属于更广的历史设计背景；阅读 v0.25.0 V1 APC 时，应以 hash、ref count、free queue 和 eviction 这条实现链为准。
 
-### 7.1 类比对象池
+## 8. 一次请求的 block 生命周期
 
-游戏服务器里经常会做对象池：
+### 8.1 请求到达
 
-```text
-频繁创建/销毁对象 -> 对象池复用 -> 减少分配开销和碎片
-```
+`EngineCoreRequest` 转成内部 `Request`，进入 Scheduler `waiting` 队列。此时不会按 `max_model_len` 预占整条序列的 blocks。
 
-vLLM 的 KV block 管理也类似：
+### 8.2 第一次调度
 
-```text
-频繁增长/释放 KV Cache -> block pool 复用 -> 减少显存碎片
-```
+Scheduler 查 prefix hit、计算新 token 数、调用 `allocate_slots()`。容量不足时，新请求可以继续等待；运行中请求也可能因 KV Cache 不足而被抢占并在之后重算。
 
-### 7.2 类比分页内存
+### 8.3 Worker 执行
 
-操作系统分页：
+Model Runner 把请求 block IDs 写入 persistent batch 的 block table，并为本轮 token 生成 slot mapping。模型 forward 将新 K/V 写入对应 slots，attention backend 从 paged KV 中读取历史。
 
-```text
-虚拟页 -> 物理页
-```
+### 8.4 继续 decode
 
-vLLM：
+新采样 token 加入请求，但要在下一轮作为输入，才产生自己的 KV。序列跨过 block 边界时，Scheduler 再申请 block。
 
-```text
-logical KV block -> physical KV block
-```
+### 8.5 完成或 abort
 
-### 7.3 类比资源调度
+Scheduler 释放请求持有的 blocks。可缓存 full blocks 的数据可能留在 pool 中等待复用；未缓存或被驱逐的 blocks 可直接承担新请求。
 
-请求不是只消耗 CPU，它还消耗 KV block。
+## 9. APC 的收益边界
 
-Scheduler 每一轮不仅要问：
+适合：
 
-```text
-哪些请求该跑？
-```
+- 固定 system prompt；
+- 相同 few-shot 示例；
+- 多个问题共享完全相同的长文档前缀；
+- 多轮请求重复提交同一段历史前缀。
 
-还要问：
+不适合或收益有限：
 
-```text
-有没有足够 KV block？
-这个请求能不能继续生成？
-是否需要抢占或等待？
-```
+- 相同文本不在前缀；
+- 前缀很短，省下的计算小于管理开销；
+- 大量唯一 prompt，没有重复；
+- 主要瓶颈是长输出 decode。
 
-## 8. Prefix Caching 和 PagedAttention 的关系
+APC 不改变模型输出，但多租户场景要考虑缓存侧信道。v0.25.0 支持 request `cache_salt`，只有相同 salt 的请求才能复用对应前缀，可用于划分信任域。
 
-Automatic Prefix Caching 的目标是：如果新请求和已有请求共享前缀，就直接复用已有前缀的 KV Cache，跳过共享部分的重复计算。
+## 10. PagedAttention 解决什么，不解决什么？
 
-PagedAttention 的 block 化设计让这种共享更自然，因为共享单位可以是 KV block。
+它帮助解决：
 
-不过要注意：Prefix Caching 不是万能的。它主要适合“前缀完全相同”的场景，比如：
+- 变长请求 KV Cache 的 block 化管理；
+- 逻辑连续、物理离散的 KV 寻址；
+- continuous batching 下的动态分配与回收；
+- APC 所需的 block 级共享基础。
 
-- 固定 system prompt。
-- 固定 few-shot 示例。
-- RAG 模板前半部分相同。
-- 多轮对话里部分上下文重复。
+它不直接解决：
 
-如果相同内容不在前缀，普通 prefix caching 的收益就会下降。
+- 模型权重显存；
+- 所有 attention 计算量；
+- tokenizer、网络与业务排队；
+- 多卡通信；
+- 错误的容量配置或无限制的外部流量。
 
-## 9. PagedAttention 解决什么，不解决什么？
+## 11. 本篇自检题
 
-### 9.1 它解决
+1. 为什么 KV Cache 公式使用 `num_kv_heads` 而不是固定使用 attention heads？
+2. “KV Cache pool 已预分配”和“请求 blocks 按需分配”为什么不矛盾？
+3. block table 如何把 token position 映射到 slot？
+4. APC 为什么只命中完整 block，为什么 hash 中要包含 parent hash？
+5. 请求结束后，`ref_cnt=0` 的缓存 block 为什么还可能保留 hash？
 
-- KV Cache 显存碎片。
-- 请求间前缀共享。
-- 长上下文/高并发下的显存利用率。
-- 动态 batch 场景下的缓存管理。
+## 12. 源码核对入口
 
-### 9.2 它不直接解决
-
-- 模型本身质量。
-- 网络延迟。
-- tokenizer 性能。
-- 业务限流。
-- 多机通信成本。
-- 所有 attention 计算量问题。
-
-PagedAttention 是内存管理和 kernel 执行层面的优化，不是模型算法本身的能力提升。
-
-## 10. 学源码时重点看什么？
-
-读源码时建议围绕问题看：
-
-```text
-1. 一个请求进来后，什么时候申请 KV block？
-2. 每个请求的 block table 存在哪里？
-3. 请求生成 token 后，KV block 如何追加？
-4. 请求结束后，KV block 如何释放？
-5. 多个请求共享前缀时，引用计数如何维护？
-6. attention kernel 如何根据 block table 读 K/V？
-```
-
-不要一开始就从 kernel 开始看。先把资源生命周期搞清楚。
-
-## 11. 本文小结
-
-KV Cache 是 LLM 推理服务的关键资源。它随着请求长度和并发动态变化，管理不好就会造成显存浪费和并发下降。
-
-PagedAttention 的核心是：
-
-```text
-把 KV Cache 拆成固定大小 block，逻辑连续，物理可不连续，用 block table 做映射。
-```
-
-它的价值是：
-
-- 近似按需分配。
-- 减少显存碎片。
-- 提高 batch 并发能力。
-- 支持 prefix sharing 和 copy-on-write。
-
-这正是 vLLM 高吞吐、高显存利用率的基础。
+- `vllm/config/cache.py`：`CacheConfig`、默认 block size、KV dtype 与显存预算。
+- `vllm/v1/core/kv_cache_utils.py`：`KVCacheBlock`。
+- `vllm/v1/core/block_pool.py`：block pool、free queue、hash mapping 与 eviction。
+- `vllm/v1/core/kv_cache_manager.py`：`get_computed_blocks()`、`allocate_slots()`、`free()`。
+- `vllm/v1/core/single_type_kv_cache_manager.py`：按 cache spec 的 block 管理。
+- `vllm/v1/core/sched/scheduler.py`：Scheduler 如何查询缓存并申请 slots。
+- `vllm/v1/worker/gpu_model_runner.py`：标准 V1 Model Runner 的 block table 与 slot mapping。
+- `vllm/v1/attention/`：当前各 attention backend 对 paged KV 的接入。
 
 ## 参考资料
 
-- PagedAttention 论文：https://arxiv.org/abs/2309.06180
-- vLLM Paged Attention 设计文档：https://docs.vllm.ai/en/latest/design/paged_attention/
-- vLLM Automatic Prefix Caching：https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/
+- [vLLM v0.25.0 Automatic Prefix Caching 设计](https://docs.vllm.ai/en/v0.25.0/design/prefix_caching/)
+- [vLLM v0.25.0 Paged Attention 历史设计页](https://docs.vllm.ai/en/v0.25.0/design/paged_attention/)
+- [vLLM v0.25.0 Engine Arguments](https://docs.vllm.ai/en/v0.25.0/configuration/engine_args/)
+- [PagedAttention 论文](https://arxiv.org/abs/2309.06180)

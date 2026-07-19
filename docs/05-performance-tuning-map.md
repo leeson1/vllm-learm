@@ -1,45 +1,46 @@
 # 05｜工程调优地图：吞吐、延迟、显存与常见参数
 
-这篇先不做完整压测，只建立 vLLM 性能调优地图。
+> 版本基线：vLLM v0.25.0。性能结论必须绑定模型、硬件、输入/输出长度分布和到达率；本文给的是实验地图，不是万能参数表。
 
-学习 vLLM 时，很容易看到一堆参数：
+调优的基本方法是：
 
 ```text
---gpu-memory-utilization
---max-model-len
---max-num-batched-tokens
---max-num-seqs
---tensor-parallel-size
---enable-prefix-caching
---dtype
---quantization
+固定 workload -> 记录基线 -> 找到资源瓶颈 -> 一次改一个变量 -> 比较完整指标
 ```
 
-不要死记参数。先理解它们分别影响什么资源。
+## 1. 先把指标定义清楚
 
-## 1. LLM 推理服务的核心指标
+### 1.1 TTFT（Time To First Token）
 
-### 1.1 TTFT
+从请求到达服务端到第一个输出 token 可用的时间。它通常包含：
 
-TTFT：Time To First Token。
+```text
+排队 + 输入处理 + 未缓存前缀的 prefill + 首 token 采样 + 输出交付
+```
 
-意思是：客户端发出请求后，多久收到第一个 token。
+所以“TTFT 主要受 prefill 影响”只是无排队时的近似。高负载下，queue time 可能更重要。
 
-它主要受 prefill 阶段影响。
+### 1.2 ITL（Inter-Token Latency）
 
-长 prompt、复杂 chat template、tokenizer 慢、排队时间长，都会导致 TTFT 变高。
+相邻输出 token 到达之间的延迟。它能展示 decode 过程中是否抖动，尤其适合 streaming 体验。
 
-### 1.2 TPOT
+### 1.3 TPOT（Time Per Output Token）
 
-TPOT：Time Per Output Token。
+请求级 decode 平均 token 时间。v0.25.0 的服务端统计口径是：
 
-意思是：生成阶段每个 token 平均耗时。
+```text
+TPOT = (最后一个 token 时间 - 第一个 token 时间) / (输出 token 数 - 1)
+```
 
-它主要受 decode 阶段影响。
+因此不把 prefill 阶段产生的首 token 计入分母；只有一个输出 token 时记录为 0。TPOT 是请求内平均值，ITL 分布能保留更多尾延迟信息；跨系统对比时仍应注明具体公式。
 
-### 1.3 Throughput
+### 1.4 E2E latency
 
-吞吐可以有多种口径：
+请求从到达到完成的总时间。它同时受 TTFT、输出长度、decode 速度和排队影响。
+
+### 1.5 Throughput
+
+至少区分：
 
 ```text
 requests/s
@@ -48,348 +49,329 @@ output tokens/s
 total tokens/s
 ```
 
-LLM serving 最常用的是 token 级吞吐。
+两个系统的 total tokens/s 相同，也可能一个偏 prefill、一个偏 decode；只给单一 tokens/s 没法判断是否适合业务。
 
-### 1.4 Tail Latency
+### 1.6 Tail latency 与 goodput
 
-尾延迟很重要。例如 P99 TTFT、P99 E2E latency。
+线上应看 P95/P99 TTFT、ITL、E2E。还可以定义满足 SLA 的 goodput，例如“TTFT < 1 s 且 ITL < 50 ms 的 requests/s”。平均值不能描述超时和长尾。
 
-平均值好看不代表线上体验好。长 prompt、长输出、排队、抢占都可能让尾延迟恶化。
-
-## 2. 三个基本资源
-
-vLLM 调优本质上是在调三类资源：
-
-```text
-GPU 显存
-GPU 算力
-CPU / 网络 / Python 服务层资源
-```
+## 2. 三类资源与两个队列
 
 ### 2.1 GPU 显存
 
-显存主要被这些东西占用：
+主要包括：
 
 ```text
 模型权重
-KV Cache
-临时激活 / workspace
-CUDA Graph / 编译缓存 / 框架开销
+KV Cache pool
+激活 / workspace / 通信 buffer
+torch.compile / CUDA Graph / 框架开销
 ```
 
-其中 KV Cache 和请求并发、上下文长度强相关。
+权重决定模型能否部署；KV Cache 容量决定能同时保留多少活动 token。vLLM 启动日志会打印 `GPU KV cache size` 和按 `max_model_len` 估算的 `Maximum concurrency`，这比只看 `nvidia-smi` 更有解释力。
 
-### 2.2 GPU 算力
+### 2.2 GPU 计算与显存带宽
 
-prefill 通常更像大矩阵计算，decode 通常更容易受 memory bandwidth、batch size、KV 读取影响。
+Prefill 通常更容易形成 compute-bound 的大矩阵；标准 decode 每序列每轮 token 少，要读取权重和历史 KV，常更依赖 batch、带宽与 kernel 效率。这是常见规律，不是所有模型/backend 的绝对分类。
 
-### 2.3 CPU 资源
+### 2.3 CPU、内存与网络
 
-不要忽视 CPU。
+API Server、Renderer、tokenizer、detokenizer、多模态加载、ZMQ、SSE、metrics 都消耗 CPU。v0.25.0 的 DP 默认会增加 API Server 与 Engine Core 数，CPU 和主存必须随进程拓扑一起规划。
 
-CPU 可能负责：
+### 2.4 外部队列与 Engine waiting queue
 
-- HTTP 请求处理。
-- tokenizer。
-- detokenizer。
-- 多模态数据加载。
-- 进程间通信。
-- streaming response。
-- metrics/logging。
+业务网关的限流/排队与 vLLM Scheduler 的 `waiting` 不是一回事。无限把请求送入 vLLM，只会把压力变成 queue time 和尾延迟。生产系统通常需要在外层按并发或 token budget 做背压。
 
-vLLM V1 是多进程架构，多卡和 data parallel 下 CPU 资源需求会上升。
+## 3. v0.25.0 的版本敏感默认值
 
-## 3. 参数一：`--gpu-memory-utilization`
+开始实验前先知道这些默认行为：
 
-示例：
+- `gpu_memory_utilization` 默认 `0.92`。
+- 对支持的模型，prefix caching 默认启用；不要把 `--enable-prefix-caching` 当成每次都必须添加的优化开关。
+- V1 在模型支持时默认启用 chunked prefill。
+- 配置兼容时，async scheduling 默认启用；可用 `--no-async-scheduling` 建立同步调试基线。
+- optimization level 默认 `-O2`。
+- `max_num_batched_tokens` 与 `max_num_seqs` 的最终默认值会随使用入口、设备内存/型号和 world size 解析，不要抄一个常数覆盖所有机器。
+
+应从启动日志或实际 `VllmConfig` 确认最终值。版本升级后重新核对，不能沿用本文默认值。
+
+## 4. 容量参数：它们各自在控制什么？
+
+### 4.1 `--gpu-memory-utilization`
 
 ```bash
-vllm serve <model> --gpu-memory-utilization 0.9
+vllm serve <model> --gpu-memory-utilization 0.92
 ```
 
-它控制 vLLM 可以使用多少比例 GPU 显存。
+它限制当前实例为 model executor 使用的 GPU 显存比例。未设置 `kv_cache_memory_bytes` 时，vLLM profiling 后用该预算推导 KV Cache 大小。
 
-直觉：
+常见方向：
 
-```text
-值越大 -> KV Cache 空间越多 -> 可能支持更高并发/更长上下文
-值越小 -> 更保守 -> OOM 风险更低，但容量下降
+- 提高：通常能留下更多 KV Cache，减少容量型等待或 preemption。
+- 降低：给同卡其他进程留空间，但 KV 容量下降。
+
+它不会让多个同卡实例自动协调；每个实例看到的是自己的比例。值越高也不是无条件更好，必须给实际共存进程和峰值分配留出安全空间。
+
+### 4.2 `--kv-cache-memory-bytes`
+
+```bash
+vllm serve <model> --kv-cache-memory-bytes 8G
 ```
 
-不要盲目设成 1.0。线上要给系统、驱动、临时 buffer 留余量。
+显式指定每张 GPU 的 KV Cache 字节数，并覆盖 `gpu_memory_utilization` 对 KV Cache 容量的推导。适合做精确容量实验，但错误估算可能导致启动失败或浪费。
 
-## 4. 参数二：`--max-model-len`
-
-示例：
+### 4.3 `--max-model-len`
 
 ```bash
 vllm serve <model> --max-model-len 8192
 ```
 
-它控制最大上下文长度。
+它限制 prompt + generation 的最大序列长度。它不是每请求预留量，也不直接决定整个 KV pool 大小。
 
-上下文越长，单请求最坏情况下需要的 KV Cache 越多。
+降低它的主要作用：
 
-如果业务只需要 4K，就不要默认开到 32K 或 128K。
+- 拒绝业务不需要的超长请求；
+- 确保至少能容纳目标序列；
+- 改变“按最大长度估算的并发数”口径。
 
-后端视角：这类似“配置最大背包容量”。容量越大，单个玩家理论上能占用的资源越高，整体并发越容易下降。
+对真实并发，应该用业务长度分布计算活动 token，而不是只用 `KV cache tokens / max_model_len`。
 
-## 5. 参数三：`--max-num-batched-tokens`
+### 4.4 `--kv-cache-dtype`
 
-它限制一次调度 batch 中的 token budget。
+KV Cache 可以独立选择 dtype。低精度 KV 能增加可缓存 token 数，但支持范围、精度影响和 kernel 性能依赖硬件/backend/模型。权重量化不会自动把 KV Cache 一起量化。
 
-可以粗略理解为：
+## 5. 调度参数：吞吐和延迟如何交换？
+
+### 5.1 `--max-num-batched-tokens`
+
+它限制单次迭代最多处理的 token 数。v0.25.0 V1 chunked prefill 会先安排 decode，再把剩余 token budget 用于 prefill。
+
+官方给出的常见方向：
+
+- 较小：prefill 对 decode 的干扰减少，ITL 往往更好。
+- 较大：一次能推进更多 prefill，TTFT 和吞吐通常更有机会改善。
+
+这不是单调保证。过大的迭代会拉长单轮执行时间；模型、GPU 和到达率不同，拐点也不同。官方对“大 GPU 上的小模型吞吐”给过 `>8192` 的建议，但不能直接当作所有环境的最优值。
+
+### 5.2 `--max-num-seqs`
+
+它是单次迭代可处理序列数上限：
+
+- 提高上限允许更大的 decode batch，但只有到达率与 KV 容量足够时才会用到。
+- 降低上限可减少同轮并发和 KV 压力，官方也把它列为频繁 preemption 时的缓解手段。
+
+设置更大不会立即为所有序列预留 KV，也不是业务层最大连接数。
+
+### 5.3 Chunked prefill
+
+支持时默认开启。它把长 prefill 切块，与 decode 混排，避免一个超长 prompt 独占整轮。重点观察：
+
+- P99 ITL 是否因长 prompt 到达而恶化；
+- 长 prompt TTFT 是否可接受；
+- 不同 `max_num_batched_tokens` 下 GPU 利用率和吞吐。
+
+### 5.4 Async scheduling
+
+它用多个 in-flight batches 重叠 CPU scheduling 与 GPU execution，通常改善 GPU 空隙。为了读源码或定位时序问题，可关闭建立同步基线；不能因为同步路径更容易理解，就把它误写成 v0.25.0 默认性能路径。
+
+## 6. Prefix caching：先测命中率，再谈收益
+
+对支持的模型，v0.25.0 默认启用 APC。调优重点不是机械加 flag，而是验证 workload 是否有重复完整前缀。
+
+观察：
 
 ```text
-每一轮 GPU forward 最多处理多少 token
+vllm:prefix_cache_queries
+vllm:prefix_cache_hits
+vllm:prompt_tokens_cached
+vllm:request_prefill_kv_computed_tokens
 ```
 
-影响：
+APC 只减少命中前缀的 prefill 计算：
 
-- 值大：可能提高吞吐，尤其 prefill-heavy 场景。
-- 值小：可能降低单轮耗时，改善部分延迟，但吞吐可能下降。
+- 固定长 system prompt/文档前缀：TTFT 和 input throughput 可能明显改善。
+- 唯一 prompt：命中率低，收益有限。
+- 长输出：decode 仍要逐步执行，ITL 不会因 APC 自动改善。
 
-这个参数和 workload 强相关，不能脱离压测空谈。
+做 A/B 时可用 `--no-enable-prefix-caching` 关闭，并保持请求顺序、前缀内容和 cache warm-up 一致。
 
-## 6. 参数四：`--max-num-seqs`
+## 7. 多 GPU：TP、PP 与 DP 的目标不同
 
-它限制同时参与调度的序列数量。
+### 7.1 Tensor Parallel（TP）
 
-可以理解为最大并发序列数上限。
+将每层参数切到多 GPU。优先用于：
 
-影响：
+- 模型单卡放不下；
+- 分摊每卡权重后需要更多 KV 空间。
 
-- 值大：并发潜力更高，但 KV Cache 压力更大。
-- 值小：更保守，尾延迟可能更稳定，但吞吐上限下降。
+代价是每层 collective communication。无 NVLink 时，PCIe 通信可能抵消收益；官方对某些不均匀或无 NVLink 场景建议评估 PP。
 
-## 7. 参数五：`--tensor-parallel-size`
+### 7.2 Pipeline Parallel（PP）
 
-示例：
+按层切分模型。适合模型跨节点、TP 已到高效上限，或模型结构更适合按层分割的情况。它会引入流水线调度与 latency trade-off。
+
+### 7.3 Data Parallel（DP）
+
+复制完整模型副本，让不同副本处理不同请求。模型已经能在一个 GPU/一组 GPU 上放下、目标是扩总吞吐时，DP 比单纯增大 TP 更符合扩容语义。
+
+记住：
+
+```text
+TP / PP：让一个模型副本跨更多卡
+DP：复制模型副本以并行服务不同请求
+```
+
+## 8. 权重 dtype、权重量化与 KV 量化
+
+三者不要混为一个开关：
+
+| 手段 | 主要改变 | 不自动保证 |
+|---|---|---|
+| `--dtype` | 权重/计算 dtype 选择 | KV 一定同格式、延迟一定下降 |
+| `--quantization` | 权重表示与对应 kernels | KV Cache 一定变小 |
+| `--kv-cache-dtype` | KV Cache 每元素字节数 | 精度无损、所有 backend 更快 |
+
+量化收益依赖 checkpoint、硬件指令、kernel 和 batch shape。只报告显存下降而不报告 TTFT/ITL/吞吐和输出质量，不算完整结论。
+
+## 9. Preemption 是容量告警，不是免费调度
+
+KV Cache 不足时，V1 可以 preempt 请求释放 blocks。v0.25.0 默认模式是 `RECOMPUTE`，不是 `SWAP`：请求之后重新计算被释放的 KV。
+
+这保证系统能继续推进，但增加计算与 E2E latency。监控：
+
+```text
+vllm:num_preemptions
+vllm:kv_cache_usage_perc
+vllm:num_requests_waiting
+vllm:request_queue_time_seconds
+```
+
+频繁 preemption 时，官方建议方向包括：增加可用 KV 预算，降低 `max_num_seqs` 或 `max_num_batched_tokens`，或通过 TP/PP 分摊权重以释放每卡 KV 空间。每个方向都有吞吐、延迟或通信代价，必须复测。
+
+## 10. 四类 workload 的观察重点
+
+| Workload | 首要指标 | 容易暴露的瓶颈 | 优先实验 |
+|---|---|---|---|
+| 短输入 + 短输出 | E2E、requests/s、P99 | HTTP/tokenizer/scheduler 开销 | 并发、DP、CPU |
+| 长输入 + 短输出 | TTFT、input tokens/s | prefill、queue、APC 命中 | prefix、chunked prefill、token budget |
+| 短输入 + 长输出 | ITL/TPOT、output tokens/s | decode、KV 增长 | seq 上限、KV 容量、并行策略 |
+| 长输入 + 长输出 | 全部尾延迟、preemption | 显存与排队共同饱和 | 容量隔离、限流、扩容 |
+
+平均输入/输出长度不够。至少保留 P50/P95/P99 或真实分布；一个少量超长请求就可能改变调度行为。
+
+## 11. 一组可复现的基线实验
+
+### 11.1 启动服务
+
+本地隔离环境可先不加 API key，避免 benchmark header 成为额外变量：
 
 ```bash
-vllm serve <model> --tensor-parallel-size 2
+vllm serve Qwen/Qwen2.5-1.5B-Instruct \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --generation-config vllm
 ```
 
-Tensor Parallel 是把一个模型拆到多张 GPU 上。
+记录完整启动日志、GPU 型号、驱动、vLLM 版本与最终解析配置。
 
-适用场景：
-
-- 单卡放不下模型。
-- 希望更高吞吐。
-- 模型较大，需要多卡协同。
-
-代价：
-
-- GPU 间通信增加。
-- 部署复杂度增加。
-- 小模型不一定收益明显。
-
-如果两张 GPU 没有 NVLink，只靠 PCIe，TP 通信可能成为瓶颈。是否值得必须压测。
-
-## 8. 参数六：`--enable-prefix-caching`
-
-Automatic Prefix Caching 适合大量请求共享相同前缀的场景。
-
-示例场景：
-
-```text
-固定 system prompt
-固定 few-shot examples
-RAG 模板前缀相同
-Agent 工作流中大量重复上下文
-```
-
-它能降低共享前缀的重复 prefill 计算。
-
-但如果请求之间没有公共前缀，收益就不明显。
-
-## 9. 参数七：dtype / quantization
-
-### 9.1 dtype
-
-常见：
+### 11.2 固定长度和到达率
 
 ```bash
---dtype auto
---dtype float16
---dtype bfloat16
+vllm bench serve \
+  --backend openai \
+  --base-url http://127.0.0.1:8000 \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --dataset-name random \
+  --random-input-len 512 \
+  --random-output-len 128 \
+  --ignore-eos \
+  --request-rate 4 \
+  --num-prompts 100 \
+  --save-result \
+  --result-dir benchmark-results
 ```
 
-精度影响：
+先 warm up，再正式采样；小样本只用于验证流程，不用于稳定的 P99 结论。
 
-- 显存占用。
-- 算子性能。
-- 硬件兼容性。
-- 数值稳定性。
+### 11.3 一次只改一个变量
 
-### 9.2 quantization
-
-量化可以降低权重显存，比如 INT8、INT4、FP8 等。
-
-但要注意：
+建议最小矩阵：
 
 ```text
-权重量化 ≠ KV Cache 一定变小
-显存下降 ≠ 延迟一定下降
+baseline
+max_num_batched_tokens: 2048 / 8192 / 16384
+max_num_seqs:           64 / 256
+prefix caching:         on / off（另做固定共享前缀 workload）
+arrival rate:           1 / 4 / 16 / inf
 ```
 
-量化可能引入额外 kernel、反量化开销，收益取决于模型、硬件、backend。
+不同参数启动出来的是不同 server run。每轮保存 command、日志和原始 JSON，不要只抄一行 tokens/s。
 
-## 10. 不同 workload 下优先看什么？
+## 12. 最小观测面
 
-### 10.1 短 prompt + 短输出
-
-常见于分类、简单问答。
-
-关注：
-
-- 请求调度开销。
-- HTTP/tokenizer 开销。
-- batch 是否足够大。
-- P99 latency。
-
-### 10.2 长 prompt + 短输出
-
-常见于 RAG、长文总结。
-
-关注：
-
-- TTFT。
-- prefill 吞吐。
-- prefix caching。
-- chunked prefill。
-- max-num-batched-tokens。
-
-### 10.3 短 prompt + 长输出
-
-常见于写作、代码生成。
-
-关注：
-
-- decode TPOT。
-- KV Cache 增长。
-- streaming 稳定性。
-- max-num-seqs。
-
-### 10.4 长 prompt + 长输出
-
-最重场景。
-
-关注：
-
-- 显存容量。
-- KV Cache。
-- 尾延迟。
-- 抢占策略。
-- 多卡/多机部署。
-
-## 11. 压测时不要只看一个指标
-
-至少要同时看：
+v0.25.0 `/metrics` 至少关注：
 
 ```text
-TTFT avg / p95 / p99
-TPOT avg / p95 / p99
-output tokens/s
-request/s
-GPU util
-GPU memory
-CPU util
-排队时间
-错误率 / OOM / timeout
+延迟：vllm:time_to_first_token_seconds
+      vllm:inter_token_latency_seconds
+      vllm:e2e_request_latency_seconds
+      vllm:request_queue_time_seconds
+
+队列：vllm:num_requests_running
+      vllm:num_requests_waiting
+      vllm:num_requests_waiting_by_reason
+
+容量：vllm:kv_cache_usage_perc
+      vllm:num_preemptions
+
+吞吐：vllm:prompt_tokens
+      vllm:generation_tokens
+
+缓存：vllm:prefix_cache_queries
+      vllm:prefix_cache_hits
+      vllm:prompt_tokens_cached
 ```
 
-如果只看 tokens/s，可能会把尾延迟调爆。
+再配合 GPU utilization/memory、CPU utilization、网络和错误率。Prometheus histogram 的 P95/P99 需要用 bucket 做 `histogram_quantile`，不能读取一个不存在的“p99 字段”。
 
-如果只看 P99，又可能把吞吐调得太保守。
+## 13. 生产落地的三个边界
 
-## 12. 一个简单调优流程
+### 13.1 外层必须背压
 
-建议流程：
+按并发请求、预估输入 token、最大输出 token 或租户配额限流。vLLM 的 `max_num_seqs` 不是完整业务限流器。
 
-```text
-1. 固定模型、硬件、业务输入输出分布
-2. 先跑默认参数，记录基线
-3. 确定瓶颈：显存、GPU 算力、CPU、网络、排队
-4. 一次只改一个参数
-5. 记录 TTFT / TPOT / throughput / OOM
-6. 找到吞吐和尾延迟的平衡点
-```
+### 13.2 性能日志不要记录敏感 prompt
 
-不要一次改一堆参数，否则不知道哪个参数起作用。
+记录长度、时间、finish reason、模型和必要采样参数即可。需要记录内容时必须经过数据治理，不能为了排障默认落盘全部用户输入。
 
-## 13. 后端工程落地建议
+### 13.3 不同 SLA 可以拆池
 
-### 13.1 服务前面一定要有限流
+短请求低延迟、长上下文、批处理和不同模型不一定适合混在同一 Scheduler。拆池会损失部分共享与聚合机会，但能隔离尾延迟和容量风险。
 
-LLM 请求成本高，不能像普通接口一样无限排队。
+## 14. 第一阶段总验收
 
-建议：
+完成前 5 篇后，应能交付一份小型实验报告，包含：
 
-- 按用户限流。
-- 按 token budget 限流。
-- 按并发数限流。
-- 对超长 prompt 做拒绝或降级。
+1. 固定版本、模型、GPU、启动命令和 workload。
+2. TTFT、ITL/TPOT、E2E、input/output throughput 的平均与尾部指标。
+3. KV Cache 使用率、waiting、preemption、GPU/CPU 利用率。
+4. 一个单变量参数实验及对结果的资源解释。
+5. 明确区分观测事实、源码事实与尚未验证的推测。
 
-### 13.2 记录 token 级指标
+## 15. 源码核对入口
 
-至少记录：
-
-```text
-input_tokens
-output_tokens
-TTFT
-E2E latency
-finish_reason
-model
-sampling params
-```
-
-否则后面无法分析性能和成本。
-
-### 13.3 区分不同模型池
-
-不同模型、不同上下文长度、不同 SLA 的请求不一定适合混在同一个服务里。
-
-可以拆成：
-
-```text
-低延迟小模型池
-高吞吐批处理池
-长上下文模型池
-代码模型池
-```
-
-### 13.4 不要只靠平均值报警
-
-建议看 P95/P99、OOM、队列长度、GPU memory watermark。
-
-## 14. 本文小结
-
-vLLM 调优的主线是：
-
-```text
-显存决定容量
-调度决定吞吐和尾延迟
-prefill 影响 TTFT
-decode 影响 TPOT
-workload 决定参数方向
-```
-
-常见参数可以按资源归类：
-
-```text
-显存容量：--gpu-memory-utilization, --max-model-len, quantization
-调度容量：--max-num-batched-tokens, --max-num-seqs
-多卡扩展：--tensor-parallel-size, --data-parallel-size
-重复前缀：--enable-prefix-caching
-```
-
-学习阶段先建立这张地图，后续再逐个深入 Scheduler、Block Manager、Attention Backend。
+- `vllm/config/cache.py`：KV Cache 容量、dtype、prefix caching 默认配置。
+- `vllm/config/scheduler.py`：token/seq budget、chunked prefill、async scheduling。
+- `vllm/config/vllm.py`：async scheduling 与 Model Runner 的兼容性解析。
+- `vllm/engine/arg_utils.py`：设备/入口相关的最终 batch 默认值。
+- `vllm/v1/core/sched/scheduler.py`：预算实际如何消费、何时 preempt。
+- `vllm/v1/metrics/`：Prometheus 指标定义与记录。
+- `vllm/benchmarks/serve.py`：`vllm bench serve` 参数与统计口径。
 
 ## 参考资料
 
-- vLLM Optimization and Tuning：https://docs.vllm.ai/en/latest/configuration/optimization/
-- vLLM Engine Arguments：https://docs.vllm.ai/en/latest/configuration/engine_args/
-- vLLM Metrics：https://docs.vllm.ai/en/latest/usage/metrics/
-- vLLM Benchmarking：https://docs.vllm.ai/en/latest/benchmarking/
+- [vLLM v0.25.0 Optimization and Tuning](https://docs.vllm.ai/en/v0.25.0/configuration/optimization/)
+- [vLLM v0.25.0 Engine Arguments](https://docs.vllm.ai/en/v0.25.0/configuration/engine_args/)
+- [vLLM v0.25.0 Production Metrics](https://docs.vllm.ai/en/v0.25.0/usage/metrics/)
+- [vLLM v0.25.0 Parallelism and Scaling](https://docs.vllm.ai/en/v0.25.0/serving/parallelism_scaling/)
+- [vLLM v0.25.0 Benchmarking](https://docs.vllm.ai/en/v0.25.0/benchmarking/)

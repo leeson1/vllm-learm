@@ -1,66 +1,57 @@
 # 02｜先跑起来：离线推理与 OpenAI-Compatible Server
 
-这一篇不深入源码，目标只有一个：先把 vLLM 跑起来，知道它最基本的两种使用方式。
+> 版本基线：vLLM v0.25.0。本文的命令固定版本，避免将未来版本的参数默认值带进当前学习笔记。
+
+这一篇的验收目标是跑通两条路径：
 
 ```text
-离线推理：Python 代码里直接 import vllm
-在线服务：启动 OpenAI-compatible HTTP server
+离线：Python -> LLM.generate -> RequestOutput
+在线：HTTP/OpenAI SDK -> vllm serve -> JSON 或 SSE
 ```
 
-## 1. 环境前提
+## 1. 先确认运行环境
 
-vLLM 主要面向 GPU 推理。实际安装前需要确认：
+v0.25.0 Quickstart 给出的通用前提是 Linux、Python 3.10–3.13。NVIDIA CUDA wheel 还要求 GPU compute capability 7.5 或更高；AMD、Intel、TPU 和 Apple Silicon 有各自安装路径，不能直接套用 CUDA 命令。
+
+本文以 Linux + NVIDIA GPU 为例：
 
 ```bash
 nvidia-smi
 python --version
-pip --version
+uv --version
 ```
 
-通常你至少需要关注：
+同时确认：
 
-- GPU 型号和显存大小。
-- NVIDIA Driver 版本。
-- CUDA / PyTorch / vLLM wheel 的兼容性。
-- 模型大小是否能放进显存。
+- 模型权重能放入单卡，或已经规划 TP/PP。
+- NVIDIA Driver 与要安装的 PyTorch backend 兼容。
+- 下载模型所需的 Hugging Face 权限已经配置；受限模型要先接受许可并登录。
+- 机器有足够的磁盘、主存和共享内存。
 
-如果只是学习，建议先用小模型，不要一开始就上 70B。
+Apple Silicon 上官方文档指向独立的 vLLM-Metal 项目；它使用 MLX 和对应模型，不等价于本文的 CUDA 环境。
 
-## 2. 安装 vLLM
+## 2. 安装固定版本
 
-最简单的方式是使用 pip：
-
-```bash
-pip install vllm
-```
-
-实际工程里更建议使用虚拟环境：
+官方 v0.25.0 Quickstart 推荐用 `uv` 创建环境，并让它根据驱动选择 PyTorch backend。为了让本仓库示例可复现，这里显式固定 vLLM 版本：
 
 ```bash
-python -m venv .venv
+uv venv --python 3.12 --seed
 source .venv/bin/activate
-pip install -U pip
-pip install vllm
+uv pip install "vllm==0.25.0" --torch-backend=auto
 ```
 
-安装后可以检查：
+检查安装结果：
 
 ```bash
 python -c "import vllm; print(vllm.__version__)"
+python -m vllm.entrypoints.cli.main --help
 ```
 
-如果这里失败，优先排查：
+第一条应该打印 `0.25.0`。如果拿到的不是这个版本，先修正环境，不要继续对照本仓库的默认值排错。
 
-- Python 版本是否支持。
-- PyTorch/CUDA 版本是否匹配。
-- 是否装到了错误的虚拟环境。
-- 机器是否真的有可用 GPU。
+## 3. 离线批量推理
 
-## 3. 第一种方式：离线推理
-
-离线推理适合学习 API、验证模型、写脚本批处理。
-
-最小例子：
+官方 Quickstart 用 `facebook/opt-125m` 演示基础 completion。它体积小，适合先验证 `LLM.generate`：
 
 ```python
 from vllm import LLM, SamplingParams
@@ -71,69 +62,93 @@ prompts = [
 ]
 
 sampling_params = SamplingParams(
-    temperature=0.8,
-    top_p=0.95,
-    max_tokens=64,
+    temperature=0.0,
+    max_tokens=32,
 )
 
-llm = LLM(model="facebook/opt-125m")
+llm = LLM(
+    model="facebook/opt-125m",
+    generation_config="vllm",
+)
 outputs = llm.generate(prompts, sampling_params)
 
 for output in outputs:
+    print("request_id:", output.request_id)
     print("prompt:", output.prompt)
-    print("output:", output.outputs[0].text)
+    print("text:", output.outputs[0].text)
+    print("finish_reason:", output.outputs[0].finish_reason)
 ```
 
-这里要理解几个对象：
+这里有四个需要分清的对象：
 
-### 3.1 LLM
+- `LLM`：离线入口，初始化引擎、加载模型并驱动生成。
+- `SamplingParams`：控制采样和停止条件，不控制模型加载。
+- `LLM.generate`：接收一个或多个 prompt，内部加入引擎等待队列并执行。
+- `RequestOutput`：每个请求的结果，包含 prompt、候选输出、token IDs 和结束原因等。
 
-`LLM` 是离线推理入口。它会负责加载模型、初始化引擎、申请显存、执行推理。
+示例显式设置 `generation_config="vllm"`，是为了避免模型仓库的 `generation_config.json` 覆盖部分采样默认值。若不设置，vLLM 默认会应用模型作者提供的 generation config；这不是错误，但做对照实验时必须记录。
 
-你可以先把它理解成：
+### 3.1 Chat 模型不要直接把 messages 传给 `generate`
 
-```text
-LLM = 本地模型推理客户端 + 推理引擎封装
-```
-
-### 3.2 SamplingParams
-
-`SamplingParams` 描述生成策略，例如：
-
-- `temperature`：随机性。
-- `top_p`： nucleus sampling。
-- `max_tokens`：最多生成多少 token。
-- `stop`：遇到哪些字符串停止。
-
-这些参数影响的是“怎么生成”，不是“模型怎么加载”。
-
-### 3.3 generate
-
-`generate` 接收一批 prompts。注意这里的“批”很重要，因为 vLLM 的性能优势来自 batch 和调度。
-
-即使你先从单请求开始，也要尽快尝试多 prompt：
+`LLM.generate` 不会自动把 OpenAI `messages` 应用为 chat template。对 instruct/chat 模型应使用 `LLM.chat`，或先用 tokenizer 渲染模板：
 
 ```python
-prompts = [f"请解释概念 {i}" for i in range(32)]
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="Qwen/Qwen2.5-1.5B-Instruct")
+conversations = [
+    [{"role": "user", "content": "用一句话解释 KV Cache"}],
+    [{"role": "user", "content": "用一句话解释 continuous batching"}],
+]
+
+outputs = llm.chat(
+    conversations,
+    SamplingParams(temperature=0.0, max_tokens=64),
+)
+
+for output in outputs:
+    print(output.outputs[0].text)
 ```
 
-观察吞吐和显存变化，会更容易理解 vLLM 的价值。
+## 4. 启动在线服务
 
-## 4. 第二种方式：在线服务
-
-在线服务适合接业务系统。
-
-启动服务：
+在线 Chat 示例使用 v0.25.0 Quickstart 同款 `Qwen/Qwen2.5-1.5B-Instruct`。它带 chat template，适合调用 `/v1/chat/completions`：
 
 ```bash
-vllm serve facebook/opt-125m \
+vllm serve Qwen/Qwen2.5-1.5B-Instruct \
   --host 0.0.0.0 \
   --port 8000 \
   --dtype auto \
-  --api-key token-abc123
+  --api-key token-abc123 \
+  --generation-config vllm
 ```
 
-然后用 OpenAI SDK 调用：
+先确认模型列表：
+
+```bash
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer token-abc123"
+```
+
+再调用 Chat Completions：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer token-abc123" \
+  -d '{
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "messages": [
+      {"role": "user", "content": "用一句话解释 vLLM 是什么"}
+    ],
+    "temperature": 0,
+    "max_tokens": 64
+  }'
+```
+
+`--generation-config vllm` 让服务使用 vLLM 的采样默认值。如果希望沿用模型作者配置，可以删掉它，但压测和线上排障时应把选择记录下来。
+
+### 4.1 用 OpenAI Python SDK 调用
 
 ```python
 from openai import OpenAI
@@ -143,160 +158,162 @@ client = OpenAI(
     api_key="token-abc123",
 )
 
-resp = client.chat.completions.create(
-    model="facebook/opt-125m",
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
     messages=[
-        {"role": "user", "content": "用一句话解释 vLLM 是什么"},
+        {"role": "user", "content": "用一句话解释 PagedAttention"},
     ],
-    max_tokens=128,
+    temperature=0,
+    max_tokens=64,
 )
 
-print(resp.choices[0].message.content)
+print(response.choices[0].message.content)
 ```
 
-也可以直接 curl：
+### 4.2 验证流式输出
 
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer token-abc123" \
-  -d '{
-    "model": "facebook/opt-125m",
-    "messages": [
-      {"role": "user", "content": "hello"}
-    ],
-    "max_tokens": 64
-  }'
+```python
+stream = client.chat.completions.create(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    messages=[{"role": "user", "content": "列出 vLLM 的三个核心组件"}],
+    temperature=0,
+    max_tokens=96,
+    stream=True,
+)
+
+for chunk in stream:
+    text = chunk.choices[0].delta.content
+    if text:
+        print(text, end="", flush=True)
+print()
 ```
 
-## 5. 离线推理和在线服务的区别
+流式响应改变的是输出交付方式，不意味着服务端一次 forward 只服务这个连接。Engine Core 仍会把多个请求持续调度到执行批次中。
 
-| 维度 | 离线推理 | 在线服务 |
+## 5. 离线与在线入口的边界
+
+| 维度 | 离线 `LLM` | `vllm serve` |
 |---|---|---|
-| 入口 | Python `LLM` 类 | `vllm serve` HTTP server |
-| 适合场景 | 学习、批处理、评测 | 业务接入、服务化、流式输出 |
-| 请求来源 | 本地代码 | 网络请求 |
-| 重点 | API 和生成参数 | 并发、鉴权、监控、部署 |
-| 对后端意义 | 理解引擎行为 | 理解生产部署 |
+| 调用方式 | 同一 Python 程序 | HTTP / OpenAI SDK |
+| 典型用途 | 批处理、评测、实验 | 业务接入、多用户并发 |
+| 输入处理 | 调用方直接传 prompt，chat 用 `LLM.chat` | API 层处理协议、chat template、tokenization |
+| 输出 | `RequestOutput` 列表 | JSON 或 SSE stream |
+| 额外关注 | 批量大小、生成参数 | 连接、鉴权、队列、指标和限流 |
 
-学习阶段建议两个都跑。
+二者共用 V1 引擎的核心调度与模型执行能力，但前端和进程拓扑不同。
 
-先用离线推理理解基本对象，再用在线服务理解服务化链路。
+## 6. 第一阶段必须理解的启动参数
 
-## 6. 常见启动参数
+### 6.1 `--dtype`
 
-### 6.1 `--model`
+模型权重和计算使用的数据类型。`auto` 会根据模型配置选择。它与 `--kv-cache-dtype` 是不同配置：权重量化或权重 dtype 改变，不代表 KV Cache 自动使用同样的量化格式。
 
-模型名或本地路径：
+### 6.2 `--tensor-parallel-size`
 
-```bash
-vllm serve /data/models/Qwen2.5-7B-Instruct
-```
-
-### 6.2 `--dtype`
-
-控制权重和计算精度。常见值：
-
-```bash
---dtype auto
---dtype float16
---dtype bfloat16
-```
-
-如果不确定，先用 `auto`。
-
-### 6.3 `--tensor-parallel-size`
-
-多 GPU 张量并行：
+把单个模型副本的层内参数切到多张 GPU：
 
 ```bash
 vllm serve <model> --tensor-parallel-size 2
 ```
 
-它表示把一个模型切到多张 GPU 上执行。适合单张卡放不下或希望提高吞吐的情况。
+优先用于模型单卡放不下，或希望分摊每卡权重压力。它会增加卡间同步；如果模型本来能在单卡高效运行，不能假设 TP 一定提高总吞吐。
 
-### 6.4 `--gpu-memory-utilization`
+### 6.3 `--gpu-memory-utilization`
 
-控制 vLLM 可以使用多少比例 GPU 显存：
+v0.25.0 默认值是 `0.92`。它表示当前 vLLM 实例为 model executor 使用的 GPU 显存比例，KV Cache 大小通常由该预算在启动 profiling 后推导。
 
 ```bash
---gpu-memory-utilization 0.9
+vllm serve <model> --gpu-memory-utilization 0.9
 ```
 
-这个参数很重要。它会影响 KV Cache 可用空间，也会影响最大并发和上下文长度。
+这是“每个实例自己的上限”，不会感知同卡其他实例的预算。多个实例各设 `0.9` 并不会自动协调成安全总量。
+
+### 6.4 `--kv-cache-memory-bytes`
+
+如果显式设置，它直接指定每张 GPU 的 KV Cache 字节数，并覆盖 `gpu_memory_utilization` 对 KV Cache 大小的推导。它更精确，但也把容量规划责任交给使用者。
 
 ### 6.5 `--max-model-len`
 
-限制最大上下文长度：
+限制单个序列的最大总长度，即 prompt token 与生成 token 的总和：
 
 ```bash
---max-model-len 8192
+vllm serve <model> --max-model-len 8192
 ```
 
-上下文越长，KV Cache 可能越大。显存紧张时，不要盲目开很大。
+它是请求准入上限，不等于“为每个请求预分配 8192 token KV”。Paged KV 仍按 block 动态分配。降低它可以拒绝不需要的超长请求，并改变日志中的最大并发估算，但不会让模型权重变小。
 
-## 7. 第一次跑不起来时怎么排查？
+### 6.6 `--max-num-batched-tokens` 与 `--max-num-seqs`
 
-### 7.1 显存不够
+前者限制一次调度迭代处理的 token 数，后者限制一次迭代处理的序列数。它们是调度上限，不是对外部请求总并发或 HTTP 连接数的完整限流器。
 
-现象可能是 OOM。
+## 7. 常见失败怎么定位？
 
-解决方向：
+### 7.1 启动阶段 OOM
 
-- 换小模型。
-- 降低 `--max-model-len`。
-- 降低 `--gpu-memory-utilization` 或释放其他进程。
-- 使用量化模型。
-- 多卡 tensor parallel。
+先判断发生在加载权重、启动 profiling，还是建立 KV Cache：
 
-### 7.2 模型下载慢或失败
+- 权重放不下：换小模型/量化 checkpoint，或使用 TP/PP。
+- 与其他进程争显存：清理占用，或给各实例规划互不冲突的预算。
+- KV Cache 预算过大：适度降低 `gpu_memory_utilization`，但容量也会下降。
+- 最大序列连一次都无法容纳：降低 `max_model_len` 或增加可用 KV 容量。
 
-可以提前下载模型到本地，然后用本地路径启动。
+“降低 `gpu_memory_utilization`”不是所有 OOM 的通用答案；它不会压缩权重。
 
-### 7.3 OpenAI SDK 调不通
+### 7.2 Chat API 报 chat template 错误
 
-检查：
+`/v1/chat/completions` 只适用于有 chat template 的生成模型。换用 instruct/chat 模型，或用 `--chat-template` 提供与模型匹配的模板。不要给基础 OPT 模型随意编一个模板并假设输出质量正确。
 
-- `base_url` 是否带 `/v1`。
-- `api_key` 是否和 `--api-key` 一致。
-- `model` 字段是否和服务端模型名匹配。
-- 端口是否被占用。
+### 7.3 请求中的 model 不匹配
 
-### 7.4 启动慢
+默认使用启动时的模型名。若配置了 `--served-model-name`，客户端应发送服务名。先查询 `/v1/models`，不要靠猜。
 
-大模型加载权重本身就慢。第一次启动还可能涉及缓存、编译、初始化等工作。
+### 7.4 输出结果和预期默认采样不同
 
-## 8. 学习时建议观察什么？
+检查模型仓库的 `generation_config.json` 是否被应用，以及请求是否显式传了 `temperature`、`top_p`、`max_tokens` 等参数。做性能对比时固定这些值。
 
-跑起来以后，不要只看输出文本。建议同时观察：
+### 7.5 下载或启动很慢
+
+区分模型下载、权重加载、torch.compile/CUDA Graph 初始化和 KV Cache profiling。首次启动可能包含多项一次性开销，不能直接当作稳态请求延迟。
+
+## 8. 跑通后的观察清单
 
 ```bash
 watch -n 1 nvidia-smi
+curl http://localhost:8000/metrics | rg \
+  'num_requests_(running|waiting)|kv_cache_usage_perc|time_to_first_token'
 ```
 
-重点看：
+至少完成四组实验：
 
-- 显存占用。
-- GPU utilization。
-- 多请求并发时显存是否增长。
-- 长 prompt 和短 prompt 的响应差异。
-- `max_tokens` 增大后 decode 时间如何变化。
+1. 单请求与 8 个并发请求。
+2. 短 prompt 与长 prompt。
+3. `max_tokens=16` 与 `max_tokens=256`。
+4. 非流式与流式请求。
 
-这会帮助你建立 LLM serving 的直觉。
+记录输入/输出 token 数、TTFT、E2E latency 和峰值显存。只看生成文本，无法建立 serving 性能直觉。
 
-## 9. 本文小结
+## 9. 本篇验收标准
 
-vLLM 有两个最重要的入口：
+- `import vllm` 显示版本 `0.25.0`。
+- 离线脚本返回两个 `RequestOutput`。
+- `/v1/models` 能看到服务模型。
+- Chat Completions 的非流式和流式调用都成功。
+- 能解释 chat template 与 `generation_config.json` 的作用。
+- 能说清 `max-model-len` 为什么不是每请求 KV 预分配大小。
 
-```text
-Python LLM 类：适合离线推理、脚本、学习
-vllm serve：适合在线服务、业务接入、OpenAI-compatible API
-```
+## 10. 源码核对入口
 
-下一篇开始进入核心原理：为什么 KV Cache 是 LLM 推理的关键资源，以及 PagedAttention 如何用“分页思想”管理它。
+- `vllm/entrypoints/llm.py`：`LLM`、`generate`、`chat`。
+- `vllm/entrypoints/cli/serve.py`：`vllm serve` 子命令。
+- `vllm/entrypoints/openai/api_server.py`：在线 server 启动与前端。
+- `vllm/v1/engine/async_llm.py`：在线异步引擎客户端。
+- `vllm/engine/arg_utils.py`：Engine 参数定义与默认值解析。
+- `vllm/config/cache.py`：`CacheConfig`，含 `gpu_memory_utilization` 和 KV Cache 配置。
+- `vllm/config/model.py`：`max_model_len` 解析。
 
 ## 参考资料
 
-- vLLM Quickstart：https://docs.vllm.ai/en/latest/getting_started/quickstart/
-- OpenAI-Compatible Server：https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/
-- vLLM Architecture Overview：https://docs.vllm.ai/en/latest/design/arch_overview/
+- [vLLM v0.25.0 Quickstart](https://docs.vllm.ai/en/v0.25.0/getting_started/quickstart/)
+- [vLLM v0.25.0 GPU Installation](https://docs.vllm.ai/en/v0.25.0/getting_started/installation/gpu/)
+- [vLLM v0.25.0 OpenAI-Compatible Server](https://docs.vllm.ai/en/v0.25.0/serving/online_serving/openai_compatible_server/)
+- [vLLM v0.25.0 Engine Arguments](https://docs.vllm.ai/en/v0.25.0/configuration/engine_args/)
