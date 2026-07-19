@@ -844,20 +844,32 @@ html&gt;body{padding:0}&lt;/style&gt;
       white-space: nowrap;
     }
     #vllm-source-atlas .flow-step[aria-pressed=&quot;true&quot;] .step-no { color: var(--primary-foreground); }
-    #vllm-source-atlas .flow-detail { display: grid; gap: .8rem; position: sticky; top: 1rem; min-width: 0; }
+    #vllm-source-atlas .flow-detail {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: .8rem;
+      position: sticky;
+      top: 1rem;
+      min-width: 0;
+    }
     #vllm-source-atlas .flow-detail h3,
     #vllm-source-atlas .flow-detail p { margin: 0; }
-    #vllm-source-atlas .detail-meta { display: grid; gap: .45rem; }
+    #vllm-source-atlas .detail-meta { display: grid; grid-template-columns: minmax(0, 1fr); gap: .45rem; }
     #vllm-source-atlas .detail-row {
       display: grid;
-      grid-template-columns: 4.5rem 1fr;
+      grid-template-columns: 4.5rem minmax(0, 1fr);
       gap: .6rem;
       align-items: start;
     }
     #vllm-source-atlas .detail-row &gt; span:first-child { color: var(--muted-foreground); }
-    #vllm-source-atlas .detail-row code,
-    #vllm-source-atlas .detail-row a,
-    #vllm-source-atlas .flow-detail p { overflow-wrap: anywhere; min-width: 0; }
+    #vllm-source-atlas .detail-row &gt; :last-child,
+    #vllm-source-atlas .flow-detail p {
+      min-width: 0;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: normal;
+    }
     #vllm-source-atlas .loop {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
